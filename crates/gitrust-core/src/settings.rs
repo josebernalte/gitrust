@@ -25,10 +25,11 @@
 
 use std::path::PathBuf;
 
+use crate::ssh::{Login, RemoteDescriptor};
 use anyhow::{Context, Result};
 
 /// Everything that is remembered between runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     /// Whether the graph answers the pointer with a wave.
     ///
@@ -36,11 +37,14 @@ pub struct Settings {
     /// somebody who has never seen it cannot ask for it. Whoever does not
     /// want it turns it off once and it stays off.
     pub waves: bool,
+    /// Remote checkouts previously selected by the user.  This is strictly
+    /// connection metadata; authentication remains with SSH agent/password.
+    pub remotes: Vec<RemoteDescriptor>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { waves: true }
+        Self { waves: true, remotes: Vec::new() }
     }
 }
 
@@ -48,7 +52,10 @@ impl Default for Settings {
 pub fn file() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+        _ => PathBuf::from(
+            std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?,
+        )
+        .join(".config"),
     };
     Some(base.join("gitrust").join("settings"))
 }
@@ -61,6 +68,22 @@ impl Settings {
         for line in text.lines() {
             match line.split_once(' ') {
                 Some(("waves", value)) => settings.waves = value.trim() == "on",
+                Some(("remote", value)) => {
+                    let fields: Vec<_> = value.split('\t').collect();
+                    if let [host, user, port, path] = fields.as_slice() {
+                        if let Ok(port) = port.parse() {
+                            if let Ok(login) =
+                                Login::new((*host).to_string(), (*user).to_string(), port)
+                            {
+                                if let Ok(remote) =
+                                    RemoteDescriptor::new(login, (*path).to_string())
+                                {
+                                    settings.remotes.push(remote);
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => continue,
             }
         }
@@ -68,10 +91,23 @@ impl Settings {
     }
 
     fn render(&self) -> String {
-        format!("waves {}\n", match self.waves {
+        let mut text = format!("waves {}\n", match self.waves {
             true => "on",
             false => "off",
-        })
+        });
+        for remote in &self.remotes {
+            text.push_str(&format!(
+                "remote {}\t{}\t{}\t{}\n",
+                remote.login.host, remote.login.user, remote.login.port, remote.path
+            ));
+        }
+        text
+    }
+
+    /// Keeps a checkout descriptor once, replacing an older identical entry.
+    pub fn remember_remote(&mut self, remote: RemoteDescriptor) {
+        self.remotes.retain(|known| known != &remote);
+        self.remotes.insert(0, remote);
     }
 
     /// What is in the file, with the defaults for whatever is not.
@@ -111,7 +147,7 @@ mod tests {
     #[test]
     fn a_setting_survives_the_trip_to_the_file_and_back() {
         for waves in [true, false] {
-            let settings = Settings { waves };
+            let settings = Settings { waves, ..Settings::default() };
             assert_eq!(Settings::parse(&settings.render()), settings);
         }
     }
@@ -128,5 +164,20 @@ mod tests {
         // point of skipping rather than giving up on the file.
         let settings = Settings::parse("waves off\nthis line is nonsense\n");
         assert!(!settings.waves);
+    }
+
+    #[test]
+    fn a_remote_checkout_is_remembered_without_a_password() {
+        let remote = RemoteDescriptor::new(
+            Login::new("host.example".to_string(), "dev".to_string(), 2222).unwrap(),
+            "/srv/project".to_string(),
+        )
+        .unwrap();
+        let mut settings = Settings::default();
+        settings.remember_remote(remote.clone());
+        let text = settings.render();
+        assert!(text.contains("remote host.example\tdev\t2222\t/srv/project"));
+        assert!(!text.contains("password"));
+        assert_eq!(Settings::parse(&text).remotes, vec![remote]);
     }
 }

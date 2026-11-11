@@ -242,10 +242,15 @@ impl App {
     fn add_remote(&mut self, session: gitrust_core::ssh::Session, path: String) {
         match RemoteRepo::new(session, path) {
             Ok(repo) => {
+                self.settings.remember_remote(repo.descriptor());
+                let saved = self.settings.save();
                 self.open.push(Open::new_remote(repo, self.opened));
                 self.opened += 1;
                 self.at = self.open.len() - 1;
                 self.picking = None;
+                if let Err(err) = saved {
+                    self.complain(err);
+                }
             }
             Err(err) => self.complain(err),
         }
@@ -602,7 +607,14 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(14, 0)),
             )
             .show(ctx, |ui| {
-                act = picker::show(ui, state, &known, &glance, &open_now);
+                act = picker::show(
+                    ui,
+                    state,
+                    &known,
+                    &glance,
+                    &open_now,
+                    &self.settings.remotes,
+                );
 
                 if let Some(cloning) = &self.cloning {
                     ui.add_space(4.0);
@@ -680,6 +692,10 @@ struct Open {
     path: String,
     /// A remote tab owns the authenticated session for its whole lifetime.
     remote: Option<RemoteRepo>,
+    /// Retained without a password so a dropped SSH session can be reopened
+    /// deliberately through the SSH agent.
+    remote_descriptor: Option<gitrust_core::ssh::RemoteDescriptor>,
+    remote_disconnected: Option<String>,
     /// A folder this tab has asked for a tab of its own.
     ///
     /// A tab cannot make a tab: the list of them belongs to the window, and
@@ -925,10 +941,13 @@ impl Open {
     }
 
     fn with_backend(path: String, salt: u64, remote: Option<RemoteRepo>) -> Self {
+        let remote_descriptor = remote.as_ref().map(RemoteRepo::descriptor);
         let mut app = Self {
             salt,
             path,
             remote,
+            remote_descriptor,
+            remote_disconnected: None,
             elsewhere: None,
             head: String::new(),
             summary: String::new(),
@@ -1095,7 +1114,7 @@ impl Open {
         self.half = repo.half_done();
         self.clashes = match repo.clashes() {
             Ok(value) => value,
-            Err(err) => return self.fail(err),
+            Err(err) => return self.remote_fail(err),
         };
         if self.half == gitrust_core::Half::None {
             self.deciding = None;
@@ -1105,18 +1124,18 @@ impl Open {
         self.stashes = repo.stashes().unwrap_or_default();
         self.refs = match repo.references() {
             Ok(value) => value,
-            Err(err) => return self.fail(err),
+            Err(err) => return self.remote_fail(err),
         };
         self.work = match repo.status() {
             Ok(value) => value,
-            Err(err) => return self.fail(err),
+            Err(err) => return self.remote_fail(err),
         };
         if let Some((path, staged)) = self.selected.clone() {
             self.diff = repo.file_diff(&path, staged).ok();
         }
         let commits = match repo.commits(self.limit) {
             Ok(value) => value,
-            Err(err) => return self.fail(err),
+            Err(err) => return self.remote_fail(err),
         };
         let total = commits.len();
         let head = self
@@ -1130,13 +1149,14 @@ impl Open {
         };
         let refs = self.refs.len();
         self.summary = format!(
-            "{total} {} across {refs} {} · remote read-only",
+            "{total} {} across {refs} {} · remote checkout",
             if total == 1 { "commit" } else { "commits" },
             if refs == 1 { "ref" } else { "refs" }
         );
         self.preselect();
         self.status = format!("read remotely in {} ms", started.elapsed().as_millis());
         self.status_failed = false;
+        self.remote_disconnected = None;
         self.reload_remote_detail();
     }
 
@@ -1784,6 +1804,26 @@ impl Open {
         match self.remote.as_ref().ok_or_else(|| anyhow::anyhow!("no remote checkout")).and_then(op) {
             Ok(()) => { self.load(); true }
             Err(err) => { self.note_error(format!("{err:#}")); false }
+        }
+    }
+
+    /// Re-authenticates deliberately through the SSH agent.  The descriptor
+    /// has no password, so a password-only server asks the user to reopen it
+    /// from the picker instead of retaining a secret for later.
+    fn reconnect_remote(&mut self) {
+        let Some(descriptor) = self.remote_descriptor.clone() else {
+            return self.note_error("this tab has no remote connection details".to_string());
+        };
+        match gitrust_core::ssh::Session::connect(descriptor.login.clone(), None, false)
+            .and_then(|session| RemoteRepo::new(session, descriptor.path.clone()))
+        {
+            Ok(repo) => {
+                self.remote = Some(repo);
+                self.remote_disconnected = None;
+                self.load();
+                self.said("remote checkout reconnected".to_string());
+            }
+            Err(err) => self.note_error(format!("could not reconnect: {err:#}")),
         }
     }
 
@@ -2799,6 +2839,12 @@ impl Open {
         self.note_error(format!("{err:#}"));
     }
 
+    fn remote_fail(&mut self, err: anyhow::Error) {
+        let message = format!("{err:#}");
+        self.remote_disconnected = Some(message.clone());
+        self.fail(anyhow::anyhow!(message));
+    }
+
     fn handle(&mut self, action: changes_view::Action) {
         use changes_view::Action;
 
@@ -3505,6 +3551,18 @@ impl Open {
                     ui.selectable_value(&mut self.view, View::History, "History");
                     ui.selectable_value(&mut self.view, View::Changes, "Changes");
                     theme::vrule(ui);
+                    if self.remote_disconnected.is_some() {
+                        ui.label(egui::RichText::new("Connection lost").color(theme::REMOVED));
+                    } else {
+                        ui.label(egui::RichText::new("Connected").color(theme::ADDED));
+                    }
+                    if ui
+                        .button("Reconnect")
+                        .on_hover_text("authenticate again through the SSH agent")
+                        .clicked()
+                    {
+                        self.reconnect_remote();
+                    }
                     let action = action_bar::show(
                         ui,
                         self.tracking.as_ref(),

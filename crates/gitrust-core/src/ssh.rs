@@ -3,6 +3,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use ssh2::{CheckResult, HashType, KnownHostFileKind, OpenFlags, OpenType, Session as RawSession};
@@ -22,6 +23,24 @@ pub struct Login {
     pub host: String,
     pub user: String,
     pub port: u16,
+}
+
+/// The non-secret part of a remote checkout.  Passwords and private-key
+/// passphrases deliberately have no place in this type or in settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDescriptor {
+    pub login: Login,
+    pub path: String,
+}
+
+impl RemoteDescriptor {
+    pub fn new(login: Login, path: String) -> Result<Self> {
+        anyhow::ensure!(
+            path.starts_with('/'),
+            "the repository path must be absolute"
+        );
+        Ok(Self { login, path })
+    }
 }
 
 impl Login {
@@ -55,6 +74,10 @@ impl Session {
     fn connect_inner(login: Login, password: Option<&str>, private_key: Option<&Path>, trust_new_host: bool, known_hosts: Option<&Path>) -> Result<Self> {
         let tcp = TcpStream::connect((login.host.as_str(), login.port))
             .with_context(|| format!("could not reach {}:{}", login.host, login.port))?;
+        tcp.set_read_timeout(Some(Duration::from_secs(15)))
+            .context("could not set the SSH read timeout")?;
+        tcp.set_write_timeout(Some(Duration::from_secs(15)))
+            .context("could not set the SSH write timeout")?;
         let mut raw = RawSession::new().context("could not prepare SSH")?;
         raw.set_tcp_stream(tcp);
         raw.handshake().context("the SSH handshake failed")?;

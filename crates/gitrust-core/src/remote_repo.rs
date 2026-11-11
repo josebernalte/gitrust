@@ -9,6 +9,7 @@ use crate::{
     ssh::Session, ChangeKind, Commit, CommitDetail, CommitFile, DiffLine, FileChange, FileDiff,
     Hunk, HunkId, Reader, RefEntry, RefKind, RefLabel, WorkingState, Writer,
 };
+use crate::ssh::RemoteDescriptor;
 
 /// A remote checkout. Its session remains open for as long as this value does.
 pub struct RemoteRepo {
@@ -103,6 +104,15 @@ impl RemoteRepo {
     pub fn new(session: Session, path: String) -> Result<Self> {
         session.verify_checkout(&path)?;
         Ok(Self { session, path })
+    }
+
+    /// Enough to reconnect later, with no password retained in memory or on
+    /// disk beyond the lifetime of the original authentication dialog.
+    pub fn descriptor(&self) -> RemoteDescriptor {
+        RemoteDescriptor {
+            login: self.session.login().clone(),
+            path: self.path.clone(),
+        }
     }
 
     pub(crate) fn git(&self, arguments: &[&str]) -> Result<String> {

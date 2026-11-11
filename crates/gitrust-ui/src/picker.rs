@@ -143,6 +143,7 @@ pub fn show(
     known: &[Known],
     glance: &HashMap<PathBuf, String>,
     open_now: &[PathBuf],
+    saved_remotes: &[ssh::RemoteDescriptor],
 ) -> Option<Act> {
     let mut act = None;
 
@@ -165,7 +166,7 @@ pub fn show(
     });
 
     ui.add_space(12.0);
-    if let Some(asked) = buttons(ui, state) {
+    if let Some(asked) = buttons(ui, state, saved_remotes) {
         act = Some(asked);
     }
 
@@ -252,7 +253,11 @@ pub fn show(
 
 /// The three ways a repository gets here, and the box behind whichever was
 /// pressed.
-fn buttons(ui: &mut egui::Ui, state: &mut Picker) -> Option<Act> {
+fn buttons(
+    ui: &mut egui::Ui,
+    state: &mut Picker,
+    saved_remotes: &[ssh::RemoteDescriptor],
+) -> Option<Act> {
     let mut act = None;
 
     ui.horizontal(|ui| {
@@ -288,7 +293,7 @@ fn buttons(ui: &mut egui::Ui, state: &mut Picker) -> Option<Act> {
     };
 
     if asking == Asking::Remote {
-        return remote_picker(ui, &mut state.remote);
+        return remote_picker(ui, &mut state.remote, saved_remotes);
     }
 
     ui.add_space(8.0);
@@ -384,9 +389,40 @@ fn buttons(ui: &mut egui::Ui, state: &mut Picker) -> Option<Act> {
 /// The first half of opening a remote checkout: authenticate and choose a
 /// folder. A verified session remains here until the remote-tab backend is
 /// ready to take ownership of it.
-fn remote_picker(ui: &mut egui::Ui, remote: &mut Remote) -> Option<Act> {
+fn remote_picker(
+    ui: &mut egui::Ui,
+    remote: &mut Remote,
+    saved_remotes: &[ssh::RemoteDescriptor],
+) -> Option<Act> {
     let mut open = None;
     ui.add_space(8.0);
+    if !saved_remotes.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("Saved checkouts")
+                    .font(theme::body(11.5))
+                    .color(theme::FAINT),
+            );
+            for saved in saved_remotes {
+                let label = format!(
+                    "{}@{}:{}{}",
+                    saved.login.user, saved.login.host, saved.login.port, saved.path
+                );
+                if ui.small_button(label).clicked() {
+                    remote.host = saved.login.host.clone();
+                    remote.user = saved.login.user.clone();
+                    remote.port = saved.login.port.to_string();
+                    remote.path = saved.path.clone();
+                    remote.session = None;
+                    remote.note = Some((
+                        "Press Connect to authenticate again; no password was saved.".to_string(),
+                        false,
+                    ));
+                }
+            }
+        });
+        ui.add_space(5.0);
+    }
     if !remote.hosts.is_empty() {
         ui.horizontal_wrapped(|ui| {
             ui.label(
@@ -456,7 +492,6 @@ fn remote_picker(ui: &mut egui::Ui, remote: &mut Remote) -> Option<Act> {
                 Ok(session) => match session.folders("/") {
                     Ok(folders) => {
                         remote.session = Some(session);
-                        remote.path = "/".to_string();
                         remote.folders = folders;
                         remote.note = Some((
                             "Connected. Choose the remote checkout folder.".to_string(),
