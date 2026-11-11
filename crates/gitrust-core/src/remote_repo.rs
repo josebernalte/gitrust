@@ -7,13 +7,96 @@ use git2::Oid;
 
 use crate::{
     ssh::Session, ChangeKind, Commit, CommitDetail, CommitFile, DiffLine, FileChange, FileDiff,
-    Hunk, HunkId, Reader, RefEntry, RefKind, RefLabel, WorkingState,
+    Hunk, HunkId, Reader, RefEntry, RefKind, RefLabel, WorkingState, Writer,
 };
 
 /// A remote checkout. Its session remains open for as long as this value does.
 pub struct RemoteRepo {
     session: Session,
     path: String,
+}
+
+impl Writer for RemoteRepo {
+    fn stage(&self, path: &str) -> Result<()> {
+        self.git(&["add", "--", path]).map(|_| ())
+    }
+
+    fn unstage(&self, path: &str) -> Result<()> {
+        self.git(&["restore", "--staged", "--", path]).map(|_| ())
+    }
+
+    fn stage_hunk(&self, path: &str, hunk: HunkId) -> Result<()> {
+        self.apply_hunk(path, hunk, false, true)
+    }
+
+    fn unstage_hunk(&self, path: &str, hunk: HunkId) -> Result<()> {
+        self.apply_hunk(path, hunk, true, true)
+    }
+
+    fn discard(&self, path: &str) -> Result<()> {
+        if self.git(&["ls-files", "-z", "--", path])?.is_empty() {
+            self.git(&["clean", "-f", "--", path]).map(|_| ())
+        } else {
+            self.git(&["restore", "--worktree", "--", path]).map(|_| ())
+        }
+    }
+
+    fn discard_hunk(&self, path: &str, hunk: HunkId) -> Result<()> {
+        self.apply_hunk(path, hunk, false, false)
+    }
+
+    fn stage_all(&self, paths: &[String]) -> Result<()> {
+        for path in paths { self.stage(path)?; }
+        Ok(())
+    }
+
+    fn unstage_all(&self, paths: &[String]) -> Result<()> {
+        for path in paths { self.unstage(path)?; }
+        Ok(())
+    }
+
+    fn discard_all(&self, paths: &[String]) -> Result<()> {
+        for path in paths { self.discard(path)?; }
+        Ok(())
+    }
+
+    fn commit(&self, message: &str) -> Result<Oid> {
+        let message = message.trim();
+        anyhow::ensure!(!message.is_empty(), "the commit message is empty");
+        self.git(&["commit", "-m", message])?;
+        self.head_oid()
+    }
+
+    fn amend(&self, message: &str) -> Result<Oid> {
+        let message = message.trim();
+        anyhow::ensure!(!message.is_empty(), "the commit message is empty");
+        self.git(&["commit", "--amend", "-m", message])?;
+        self.head_oid()
+    }
+}
+
+impl RemoteRepo {
+    fn apply_hunk(&self, path: &str, wanted: HunkId, staged: bool, index: bool) -> Result<()> {
+        let mut args = vec!["diff", "--no-ext-diff", "--unified=3"];
+        if staged { args.push("--cached"); }
+        args.extend(["--", path]);
+        let patch = one_hunk_patch(&self.git(&args)?, wanted)?;
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let temporary = format!("/tmp/gitrust-hunk-{}-{nonce}.patch", std::process::id());
+        self.session.write_file(&temporary, patch.as_bytes())?;
+        let mut apply = vec!["apply"];
+        if index { apply.push("--cached"); }
+        if staged || !index { apply.push("--reverse"); }
+        apply.push(&temporary);
+        let result = self.git(&apply).map(|_| ());
+        let _ = self.session.command(&["rm", "-f", &temporary]);
+        result
+    }
+
+    fn head_oid(&self) -> Result<Oid> {
+        Oid::from_str(self.git(&["rev-parse", "HEAD"] )?.trim())
+            .context("remote Git returned an invalid HEAD")
+    }
 }
 
 impl RemoteRepo {
@@ -26,6 +109,23 @@ impl RemoteRepo {
         let mut words = vec!["git", "-C", &self.path];
         words.extend(arguments);
         self.session.command(&words)
+    }
+
+    pub fn read_working_file(&self, path: &str) -> Result<Vec<u8>> {
+        anyhow::ensure!(!path.starts_with('/') && !path.split('/').any(|part| part == ".."), "remote file path escapes the checkout");
+        self.session.read_file(&format!("{}/{}", self.path.trim_end_matches('/'), path))
+    }
+
+    pub fn write_working_file(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        anyhow::ensure!(!path.starts_with('/') && !path.split('/').any(|part| part == ".."), "remote file path escapes the checkout");
+        self.session.write_file(&format!("{}/{}", self.path.trim_end_matches('/'), path), bytes)
+    }
+
+    pub fn head_message(&self) -> Result<(String, String)> {
+        let output = self.git(&["show", "--no-patch", "--format=%s%x1f%b", "HEAD"])?;
+        let (subject, body) = output.trim_end_matches('\n').split_once('\x1f')
+            .context("remote Git returned an incomplete commit message")?;
+        Ok((subject.to_string(), body.to_string()))
     }
 
     fn ref_labels(&self) -> Result<HashMap<Oid, Vec<RefLabel>>> {
@@ -276,6 +376,28 @@ fn parse_diff(path: &str, text: &str) -> Result<FileDiff> {
     Ok(diff)
 }
 
+fn one_hunk_patch(diff: &str, wanted: HunkId) -> Result<String> {
+    let mut patch = String::new();
+    let mut selected = false;
+    let mut found = false;
+    let mut before_hunks = true;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("@@ ") {
+            before_hunks = false;
+            let header = line.trim_end_matches('\n');
+            selected = hunk_id(header)? == wanted;
+            found |= selected;
+            if selected { patch.push_str(line); }
+        } else if before_hunks {
+            patch.push_str(line);
+        } else if selected {
+            patch.push_str(line);
+        }
+    }
+    anyhow::ensure!(found, "that hunk is gone; reload the diff");
+    Ok(patch)
+}
+
 fn hunk_id(header: &str) -> Result<HunkId> {
     let mut pieces = header.split_whitespace();
     let old = pieces
@@ -470,6 +592,15 @@ mod tests {
         );
         assert_eq!(diff.hunks[0].lines[1].old_lineno, Some(3));
         assert_eq!(diff.hunks[0].lines[2].new_lineno, Some(3));
+    }
+
+    #[test]
+    fn one_hunk_patch_keeps_the_header_and_only_the_chosen_hunk() {
+        let diff = "diff --git a/note b/note\n--- a/note\n+++ b/note\n@@ -1 +1 @@\n-old\n+new\n@@ -8 +8 @@\n-before\n+after\n";
+        let patch = one_hunk_patch(diff, HunkId { old_start: 8, old_lines: 1, new_start: 8, new_lines: 1 }).unwrap();
+        assert!(patch.contains("diff --git"));
+        assert!(patch.contains("+after"));
+        assert!(!patch.contains("+new"));
     }
 
     #[test]

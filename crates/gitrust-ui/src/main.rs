@@ -35,7 +35,7 @@ use eframe::egui;
 use gitrust_core::{
     compose, layout, layout_with_working, Backlog, Board, CommitDetail, FileDiff, Graph, HunkId,
     Join, Move, Oid, PullMode, PullRequests, Reader, RefEntry, RefKind, RemoteRepo, Repo, Settings,
-    StashEntry, Tracking, WorkingState, Worktree,
+    StashEntry, Tracking, WorkingState, Worktree, Writer,
 };
 
 /// How wide the repository menu is, measured inside its frame.
@@ -1403,6 +1403,8 @@ impl Open {
             how: file_view::Look::Diff,
             read: file_view::Read::default(),
             trouble: None,
+            editing: false,
+            draft: String::new(),
         });
         self.read_file();
     }
@@ -1430,6 +1432,13 @@ impl Open {
             return;
         }
 
+        if let Some(remote) = self.remote.as_ref() {
+            if how == file_view::Look::Whole {
+                let read = remote.read_working_file(&path).map(|bytes| match String::from_utf8(bytes) { Ok(text) => gitrust_core::Contents::Text(text), Err(err) => gitrust_core::Contents::Binary(err.into_bytes().len()) });
+                if let Some(looking) = &mut self.looking { match read { Ok(whole) => looking.read.whole = Some(whole), Err(err) => looking.trouble = Some(format!("{err:#}")) } }
+            }
+            return;
+        }
         let Ok(repo) = self.repo() else {
             return;
         };
@@ -1719,6 +1728,13 @@ impl Open {
                 let (path, at) = (looking.path.clone(), looking.at);
                 self.note_down(move |repo| repo.revert_hunk(at, &path, hunk));
             }
+            file_view::Act::Save(text) => {
+                let Some(path) = self.looking.as_ref().map(|looking| looking.path.clone()) else { return };
+                match self.remote.as_ref().ok_or_else(|| anyhow::anyhow!("not a remote checkout")).and_then(|repo| repo.write_working_file(&path, text.as_bytes())) {
+                    Ok(()) => { if let Some(looking) = &mut self.looking { looking.editing = false; looking.read.whole = Some(gitrust_core::Contents::Text(text)); } self.load(); self.said(format!("{path} saved remotely")); }
+                    Err(err) => self.note_error(format!("{err:#}")),
+                }
+            }
         }
     }
 
@@ -1733,6 +1749,13 @@ impl Open {
                 self.note_error(format!("{err:#}"));
                 false
             }
+        }
+    }
+
+    fn run_remote(&mut self, op: impl FnOnce(&RemoteRepo) -> Result<()>) -> bool {
+        match self.remote.as_ref().ok_or_else(|| anyhow::anyhow!("no remote checkout")).and_then(op) {
+            Ok(()) => { self.load(); true }
+            Err(err) => { self.note_error(format!("{err:#}")); false }
         }
     }
 
@@ -2174,8 +2197,11 @@ impl Open {
     /// Does what has already been answered yes to.
     fn commit_deed(&mut self, deed: Deed) {
         let discarded = match deed {
+            Deed::Discard(path) if self.is_remote() => self.run_remote(|repo| repo.discard(&path)),
             Deed::Discard(path) => self.run(|repo| repo.discard(&path)),
+            Deed::DiscardHunk { path, hunk } if self.is_remote() => self.run_remote(|repo| repo.discard_hunk(&path, hunk)),
             Deed::DiscardHunk { path, hunk } => self.run(|repo| repo.discard_hunk(&path, hunk)),
+            Deed::DiscardAll(paths) if self.is_remote() => self.run_remote(|repo| repo.discard_all(&paths)),
             Deed::DiscardAll(paths) => self.run(|repo| repo.discard_all(&paths)),
 
             // The remote one goes out on the network; the one here is instant.
@@ -2732,14 +2758,22 @@ impl Open {
                         .ok(),
                 };
             }
+            Action::Stage(path) if self.is_remote() => { self.run_remote(|repo| repo.stage(&path)); }
             Action::Stage(path) => {
                 self.run(|repo| repo.stage(&path));
             }
+            Action::Unstage(path) if self.is_remote() => { self.run_remote(|repo| repo.unstage(&path)); }
             Action::Unstage(path) => {
                 self.run(|repo| repo.unstage(&path));
             }
+            Action::StageHunk { path, hunk } if self.is_remote() => {
+                self.run_remote(|repo| repo.stage_hunk(&path, hunk));
+            }
             Action::StageHunk { path, hunk } => {
                 self.run(|repo| repo.stage_hunk(&path, hunk));
+            }
+            Action::UnstageHunk { path, hunk } if self.is_remote() => {
+                self.run_remote(|repo| repo.unstage_hunk(&path, hunk));
             }
             Action::UnstageHunk { path, hunk } => {
                 self.run(|repo| repo.unstage_hunk(&path, hunk));
@@ -2780,10 +2814,18 @@ impl Open {
                     Deed::DiscardAll(paths),
                 );
             }
+            Action::StageAll if self.is_remote() => {
+                let paths: Vec<String> = self.work.unstaged.iter().map(|file| file.path.clone()).collect();
+                self.run_remote(|repo| repo.stage_all(&paths));
+            }
             Action::StageAll => {
                 let paths: Vec<String> =
                     self.work.unstaged.iter().map(|f| f.path.clone()).collect();
                 self.run(|repo| repo.stage_all(&paths));
+            }
+            Action::UnstageAll if self.is_remote() => {
+                let paths: Vec<String> = self.work.staged.iter().map(|file| file.path.clone()).collect();
+                self.run_remote(|repo| repo.unstage_all(&paths));
             }
             Action::UnstageAll => {
                 let paths: Vec<String> = self.work.staged.iter().map(|f| f.path.clone()).collect();
@@ -2795,14 +2837,24 @@ impl Open {
                     // written is kept: taking the switch off has to give it
                     // back, not have lost it along the way.
                     self.saved = Some((self.subject.clone(), self.body.clone()));
-                    if let Some((subject, body)) =
-                        self.repo().ok().and_then(|repo| repo.head_message())
-                    {
+                    let message = match self.remote.as_ref() {
+                        Some(repo) => repo.head_message().ok(),
+                        None => self.repo().ok().and_then(|repo| repo.head_message()),
+                    };
+                    if let Some((subject, body)) = message {
                         self.subject = subject;
                         self.body = body;
                     }
                 } else {
                     self.drop_amend();
+                }
+            }
+            Action::Amend if self.is_remote() => {
+                let message = compose(&self.subject, &self.body);
+                let result = self.remote.as_ref().ok_or_else(|| anyhow::anyhow!("no remote checkout")).and_then(|repo| repo.amend(&message));
+                match result {
+                    Ok(oid) => { self.saved = None; self.subject.clear(); self.body.clear(); self.selected_commit = Some(oid); self.detail_file = None; self.load(); self.said("last remote commit redone".to_string()); }
+                    Err(err) => self.note_error(format!("{err:#}")),
                 }
             }
             Action::Amend => {
@@ -2819,6 +2871,14 @@ impl Open {
                         self.load();
                         self.said("last commit redone".to_string());
                     }
+                    Err(err) => self.note_error(format!("{err:#}")),
+                }
+            }
+            Action::Commit if self.is_remote() => {
+                let message = compose(&self.subject, &self.body);
+                let result = self.remote.as_ref().ok_or_else(|| anyhow::anyhow!("no remote checkout")).and_then(|repo| repo.commit(&message));
+                match result {
+                    Ok(oid) => { self.subject.clear(); self.body.clear(); self.selected_commit = Some(oid); self.detail_file = None; self.load(); self.said(format!("commit created on {}", self.head)); }
                     Err(err) => self.note_error(format!("{err:#}")),
                 }
             }
@@ -2964,6 +3024,8 @@ impl Open {
         // taking them away would leave only the Back button.
         if self.looking.is_some() {
             let mut act = None;
+            let busy = self.job.is_some();
+            let editable = self.is_remote();
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::NONE
@@ -2972,8 +3034,8 @@ impl Open {
                 )
                 .show(ctx, |ui| {
                     ui.push_id(self.salt, |ui| {
-                        if let Some(looking) = &self.looking {
-                            act = file_view::show(ui, looking, self.job.is_some());
+                        if let Some(looking) = &mut self.looking {
+                            act = file_view::show(ui, looking, busy, editable);
                         }
                     });
                 });
@@ -3159,8 +3221,12 @@ impl Open {
                     }
                 }
                 View::Changes => {
-                    let read_only = self.is_remote();
-                    let (amendable, pushed) = self.amend_state();
+                    let read_only = false;
+                    let (amendable, pushed) = if self.is_remote() {
+                        (!self.graph.rows.is_empty(), None)
+                    } else {
+                        self.amend_state()
+                    };
                     let selected = self
                         .selected
                         .as_ref()

@@ -1,11 +1,11 @@
 //! SSH/SFTP access to a checkout that stays on another machine.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use ssh2::{CheckResult, HashType, KnownHostFileKind, Session as RawSession};
+use ssh2::{CheckResult, HashType, KnownHostFileKind, OpenFlags, OpenType, Session as RawSession};
 
 /// An ordinary `Host` entry in the user's SSH configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +94,26 @@ impl Session {
 
     pub fn login(&self) -> &Login {
         &self.login
+    }
+
+    /// Reads a working-tree file over SFTP. The caller decides whether its
+    /// bytes are text; SSH never creates a local copy.
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let sftp = self.raw.sftp().context("could not start SFTP")?;
+        let mut file = sftp.open(Path::new(path)).with_context(|| format!("could not read {path}"))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).with_context(|| format!("could not read {path}"))?;
+        Ok(bytes)
+    }
+
+    /// Replaces a working-tree file over SFTP. Git index changes remain Git
+    /// commands and are deliberately not hidden in this transport method.
+    pub fn write_file(&self, path: &str, bytes: &[u8]) -> Result<()> {
+        let sftp = self.raw.sftp().context("could not start SFTP")?;
+        let mut file = sftp.open_mode(Path::new(path), OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE, 0o644, OpenType::File)
+            .with_context(|| format!("could not write {path}"))?;
+        file.write_all(bytes).with_context(|| format!("could not write {path}"))?;
+        Ok(())
     }
 
     pub(crate) fn command(&self, words: &[&str]) -> Result<String> {

@@ -30,6 +30,7 @@ pub mod start;
 pub mod status;
 pub mod tag;
 pub mod worktree;
+pub mod writer;
 
 pub use backlog::{Backlog, Item};
 pub use board::{Board, Card, Lane};
@@ -55,3 +56,4 @@ pub use settings::Settings;
 pub use stash::StashEntry;
 pub use status::{ChangeKind, FileChange, WorkingState};
 pub use worktree::Worktree;
+pub use writer::Writer;

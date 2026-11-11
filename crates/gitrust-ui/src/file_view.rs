@@ -63,6 +63,7 @@ pub enum Act {
     At(Oid),
     /// Undo that piece of this commit, in the working tree.
     Revert(HunkId),
+    Save(String),
 }
 
 /// Everything read for the file being looked at.
@@ -99,9 +100,11 @@ pub struct Looking {
     /// text refuses, and that refusal belongs on the screen rather than in a
     /// status bar that the next thing overwrites.
     pub trouble: Option<String>,
+    pub editing: bool,
+    pub draft: String,
 }
 
-pub fn show(ui: &mut egui::Ui, looking: &Looking, busy: bool) -> Option<Act> {
+pub fn show(ui: &mut egui::Ui, looking: &mut Looking, busy: bool, editable: bool) -> Option<Act> {
     let mut act = None;
 
     ui.add_space(10.0);
@@ -171,7 +174,7 @@ pub fn show(ui: &mut egui::Ui, looking: &Looking, busy: bool) -> Option<Act> {
                     ui.add_space(6.0);
                     match looking.how {
                         Look::Diff => diff(ui, looking, busy, &mut act),
-                        Look::Whole => whole(ui, looking),
+                        Look::Whole => whole(ui, looking, editable, &mut act),
                         Look::Blame => blame(ui, looking, &mut act),
                     }
                     ui.add_space(20.0);
@@ -344,7 +347,7 @@ fn diff(ui: &mut egui::Ui, looking: &Looking, busy: bool, act: &mut Option<Act>)
     }
 }
 
-fn whole(ui: &mut egui::Ui, looking: &Looking) {
+fn whole(ui: &mut egui::Ui, looking: &mut Looking, editable: bool, act: &mut Option<Act>) {
     match &looking.read.whole {
         None => theme::empty(ui, "Reading it\u{2026}"),
         Some(Contents::Absent) => {
@@ -355,6 +358,20 @@ fn whole(ui: &mut egui::Ui, looking: &Looking) {
             &format!("Not text: {size} bytes of something else"),
         ),
         Some(Contents::Text(text)) => {
+            if editable {
+                if !looking.editing && ui.button("Edit remote file").clicked() {
+                    looking.editing = true;
+                    looking.draft = text.clone();
+                }
+                if looking.editing {
+                    ui.add(egui::TextEdit::multiline(&mut looking.draft).desired_width(f32::INFINITY).desired_rows(24).font(theme::mono(11.5)));
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() { looking.editing = false; }
+                        if ui.button("Save remote file").clicked() { *act = Some(Act::Save(looking.draft.clone())); }
+                    });
+                    return;
+                }
+            }
             // Painted as numbered lines rather than put in a text box: a box
             // would let somebody type into a file as it was in 2023, which
             // is not a thing that can be done.
