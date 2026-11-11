@@ -58,7 +58,10 @@ struct Shares {
 
 impl Default for Shares {
     fn default() -> Self {
-        Self { body: BODY, files: FILES }
+        Self {
+            body: BODY,
+            files: FILES,
+        }
     }
 }
 
@@ -80,6 +83,7 @@ pub fn show(
     selected_file: Option<&str>,
     diff: Option<&FileDiff>,
     tag: &mut TagDraft,
+    read_only: bool,
 ) -> Option<Pick> {
     let Some(detail) = detail else {
         theme::empty(ui, "Pick a commit in the graph to see it here");
@@ -181,8 +185,10 @@ pub fn show(
     // What can be done to this commit. One thing for now, but the row is set
     // up for the ones to come.
     ui.add_space(9.0);
-    if let Some(action) = tag_menu(ui, tag) {
-        picked = Some(action);
+    if !read_only {
+        if let Some(action) = tag_menu(ui, tag) {
+            picked = Some(action);
+        }
     }
 
     // A line with nothing above it to resize is just a line.
@@ -292,7 +298,9 @@ pub fn show(
 /// annotated tag is exactly whoever has something to say about it.
 fn tag_menu(ui: &mut egui::Ui, draft: &mut TagDraft) -> Option<Pick> {
     let button = ui.add(egui::Button::new(
-        RichText::new("Tag          ").font(theme::body(11.5)).color(theme::MUTED),
+        RichText::new("Tag          ")
+            .font(theme::body(11.5))
+            .color(theme::MUTED),
     ));
     theme::caret(ui, &button);
     let id = ui.make_persistent_id("menu-tag");
@@ -301,52 +309,58 @@ fn tag_menu(ui: &mut egui::Ui, draft: &mut TagDraft) -> Option<Pick> {
         ui.memory_mut(|memory| memory.toggle_popup(id));
     }
 
-    egui::popup::popup_below_widget(ui, id, &button, PopupCloseBehavior::CloseOnClickOutside, |ui| {
-        ui.set_min_width(266.0);
-        ui.label(
-            RichText::new("Tag on this commit")
-                .font(theme::medium(12.0))
-                .color(theme::TEXT),
-        );
-        ui.add_space(5.0);
+    egui::popup::popup_below_widget(
+        ui,
+        id,
+        &button,
+        PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(266.0);
+            ui.label(
+                RichText::new("Tag on this commit")
+                    .font(theme::medium(12.0))
+                    .color(theme::TEXT),
+            );
+            ui.add_space(5.0);
 
-        let entry = ui.add(
-            egui::TextEdit::singleline(&mut draft.name)
-                .desired_width(f32::INFINITY)
-                .margin(egui::vec2(8.0, 5.0))
-                .font(theme::mono(12.0))
-                .hint_text(RichText::new("v1.0").color(theme::FAINT)),
-        );
-        ui.add_space(5.0);
-        ui.add(
-            egui::TextEdit::multiline(&mut draft.message)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .margin(egui::vec2(8.0, 5.0))
-                .font(theme::body(11.5))
-                .hint_text(RichText::new("what this version brings").color(theme::FAINT)),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            RichText::new("With a message it is annotated; without one, lightweight")
-                .font(theme::body(10.5))
-                .color(theme::FAINT),
-        );
-        ui.add_space(6.0);
+            let entry = ui.add(
+                egui::TextEdit::singleline(&mut draft.name)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::vec2(8.0, 5.0))
+                    .font(theme::mono(12.0))
+                    .hint_text(RichText::new("v1.0").color(theme::FAINT)),
+            );
+            ui.add_space(5.0);
+            ui.add(
+                egui::TextEdit::multiline(&mut draft.message)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::vec2(8.0, 5.0))
+                    .font(theme::body(11.5))
+                    .hint_text(RichText::new("what this version brings").color(theme::FAINT)),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("With a message it is annotated; without one, lightweight")
+                    .font(theme::body(10.5))
+                    .color(theme::FAINT),
+            );
+            ui.add_space(6.0);
 
-        let entered = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let pressed = ui
-            .add_enabled(!draft.name.trim().is_empty(), egui::Button::new("Create"))
-            .clicked();
+            let entered = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let pressed = ui
+                .add_enabled(!draft.name.trim().is_empty(), egui::Button::new("Create"))
+                .clicked();
 
-        (entered || pressed).then(|| {
-            ui.memory_mut(|memory| memory.close_popup());
-            Pick::Tag {
-                name: std::mem::take(&mut draft.name),
-                message: std::mem::take(&mut draft.message),
-            }
-        })
-    })
+            (entered || pressed).then(|| {
+                ui.memory_mut(|memory| memory.close_popup());
+                Pick::Tag {
+                    name: std::mem::take(&mut draft.name),
+                    message: std::mem::take(&mut draft.message),
+                }
+            })
+        },
+    )
     .flatten()
 }
 

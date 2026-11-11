@@ -8,17 +8,32 @@ use crate::{diff_view, theme};
 /// What the user has asked for in this frame. The view does not touch the
 /// repository: it only describes the intention and lets `main` carry it out.
 pub enum Action {
-    Select { path: String, staged: bool },
+    Select {
+        path: String,
+        staged: bool,
+    },
     Stage(String),
     Unstage(String),
-    StageHunk { path: String, hunk: HunkId },
-    UnstageHunk { path: String, hunk: HunkId },
+    StageHunk {
+        path: String,
+        hunk: HunkId,
+    },
+    UnstageHunk {
+        path: String,
+        hunk: HunkId,
+    },
     StageAll,
     UnstageAll,
     /// Throw away a file's changes. `untracked` changes what is lost: a new
     /// file is deleted whole, a known one goes back to the index.
-    Discard { path: String, untracked: bool },
-    DiscardHunk { path: String, hunk: HunkId },
+    Discard {
+        path: String,
+        untracked: bool,
+    },
+    DiscardHunk {
+        path: String,
+        hunk: HunkId,
+    },
     DiscardAll,
     Commit,
     Amend,
@@ -58,6 +73,7 @@ pub fn show(
     selected: Option<(&str, bool)>,
     diff: Option<&FileDiff>,
     draft: &mut Draft<'_>,
+    read_only: bool,
 ) -> Option<Action> {
     let mut action = None;
 
@@ -78,16 +94,34 @@ pub fn show(
                         .fill(theme::PANEL)
                         .inner_margin(egui::Margin::symmetric(0, 10)),
                 )
-                .show_inside(ui, |ui| commit_box(ui, state, draft, &mut action));
+                .show_inside(ui, |ui| {
+                    ui.add_enabled_ui(!read_only, |ui| commit_box(ui, state, draft, &mut action))
+                });
 
             egui::ScrollArea::vertical()
                 .id_salt("lists")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add_space(10.0);
-                    section(ui, "Staged", &state.staged, selected, true, &mut action);
+                    section(
+                        ui,
+                        "Staged",
+                        &state.staged,
+                        selected,
+                        true,
+                        &mut action,
+                        read_only,
+                    );
                     ui.add_space(14.0);
-                    section(ui, "Unstaged", &state.unstaged, selected, false, &mut action);
+                    section(
+                        ui,
+                        "Unstaged",
+                        &state.unstaged,
+                        selected,
+                        false,
+                        &mut action,
+                        read_only,
+                    );
                     ui.add_space(10.0);
                 });
         });
@@ -99,7 +133,7 @@ pub fn show(
                 .inner_margin(egui::Margin::symmetric(12, 8)),
         )
         .show_inside(ui, |ui| {
-            show_diff(ui, selected, diff, &mut action);
+            show_diff(ui, selected, diff, &mut action, read_only);
         });
 
     action
@@ -128,9 +162,13 @@ pub fn compact(
     ui.add_space(3.0);
     let note = theme::pending_label(state.staged.len(), state.unstaged.len());
     ui.label(
-        RichText::new(if note.is_empty() { "The working tree is clean".to_string() } else { note })
-            .font(theme::body(11.5))
-            .color(theme::MUTED),
+        RichText::new(if note.is_empty() {
+            "The working tree is clean".to_string()
+        } else {
+            note
+        })
+        .font(theme::body(11.5))
+        .color(theme::MUTED),
     );
 
     theme::rule(ui);
@@ -143,15 +181,31 @@ pub fn compact(
         .max_height(list_height)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            section(ui, "Staged", &state.staged, selected, true, &mut action);
+            section(
+                ui,
+                "Staged",
+                &state.staged,
+                selected,
+                true,
+                &mut action,
+                false,
+            );
             ui.add_space(12.0);
-            section(ui, "Unstaged", &state.unstaged, selected, false, &mut action);
+            section(
+                ui,
+                "Unstaged",
+                &state.unstaged,
+                selected,
+                false,
+                &mut action,
+                false,
+            );
         });
 
     theme::rule(ui);
     commit_box(ui, state, draft, &mut action);
     theme::rule(ui);
-    show_diff(ui, selected, diff, &mut action);
+    show_diff(ui, selected, diff, &mut action, false);
 
     action
 }
@@ -215,13 +269,16 @@ fn commit_box(
     // the last commit is half the times anyone amends.
     let amending = *draft.amend;
     let ready = !draft.subject.trim().is_empty() && (amending || !state.staged.is_empty());
-    let shortcut =
-        ready && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
+    let shortcut = ready && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
 
     ui.horizontal(|ui| {
         let label = if amending { "Amend" } else { "Commit" };
         let button = egui::Button::new(RichText::new(label).font(theme::medium(13.0)))
-            .fill(if ready { theme::tint(theme::lane(0), 54) } else { theme::RAISED })
+            .fill(if ready {
+                theme::tint(theme::lane(0), 54)
+            } else {
+                theme::RAISED
+            })
             .min_size(egui::vec2(88.0, 28.0));
 
         if ui
@@ -230,7 +287,11 @@ fn commit_box(
             .clicked()
             || shortcut
         {
-            *action = Some(if amending { Action::Amend } else { Action::Commit });
+            *action = Some(if amending {
+                Action::Amend
+            } else {
+                Action::Commit
+            });
         }
 
         // If there is nothing to commit, the hint says what is missing instead
@@ -288,6 +349,7 @@ fn section(
     selected: Option<(&str, bool)>,
     staged: bool,
     action: &mut Option<Action>,
+    read_only: bool,
 ) {
     ui.horizontal(|ui| {
         ui.add_space(2.0);
@@ -306,23 +368,35 @@ fn section(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label = if staged { "Unstage all" } else { "Stage all" };
                 if ui
-                    .add(egui::Button::new(
-                        RichText::new(label).font(theme::body(11.0)).color(theme::MUTED),
-                    ))
+                    .add_enabled(
+                        !read_only,
+                        egui::Button::new(
+                            RichText::new(label)
+                                .font(theme::body(11.0))
+                                .color(theme::MUTED),
+                        ),
+                    )
                     .clicked()
                 {
-                    *action = Some(if staged { Action::UnstageAll } else { Action::StageAll });
+                    *action = Some(if staged {
+                        Action::UnstageAll
+                    } else {
+                        Action::StageAll
+                    });
                 }
 
                 // Throwing away a whole side cannot be undone, so it wears the
                 // color of what is being deleted and does not go first.
                 if !staged
                     && ui
-                        .add(egui::Button::new(
-                            RichText::new("Discard all")
-                                .font(theme::body(11.0))
-                                .color(theme::REMOVED),
-                        ))
+                        .add_enabled(
+                            !read_only,
+                            egui::Button::new(
+                                RichText::new("Discard all")
+                                    .font(theme::body(11.0))
+                                    .color(theme::REMOVED),
+                            ),
+                        )
                         .clicked()
                 {
                     *action = Some(Action::DiscardAll);
@@ -356,7 +430,8 @@ fn section(
             let button = if staged { "−" } else { "+" };
             let hint = if staged { "Unstage" } else { "Stage" };
             if ui
-                .add(
+                .add_enabled(
+                    !read_only,
                     egui::Button::new(RichText::new(button).font(theme::mono(12.0)))
                         .min_size(egui::vec2(22.0, 20.0)),
                 )
@@ -382,7 +457,10 @@ fn section(
                 .on_hover_text(&file.path)
                 .clicked()
             {
-                *action = Some(Action::Select { path: file.path.clone(), staged });
+                *action = Some(Action::Select {
+                    path: file.path.clone(),
+                    staged,
+                });
             }
 
             // The throw-away one goes to the far end of the row, away from
@@ -391,9 +469,12 @@ fn section(
             if !staged {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(
+                        .add_enabled(
+                            !read_only,
                             egui::Button::new(
-                                RichText::new("×").font(theme::mono(12.0)).color(theme::MUTED),
+                                RichText::new("×")
+                                    .font(theme::mono(12.0))
+                                    .color(theme::MUTED),
                             )
                             .min_size(egui::vec2(20.0, 20.0)),
                         )
@@ -416,6 +497,7 @@ fn show_diff(
     selected: Option<(&str, bool)>,
     diff: Option<&FileDiff>,
     action: &mut Option<Action>,
+    read_only: bool,
 ) {
     let Some((path, staged)) = selected else {
         theme::empty(ui, "Pick a file to see what changed");
@@ -425,9 +507,13 @@ fn show_diff(
     ui.horizontal(|ui| {
         ui.label(theme::path_text(path, 12.5, false));
         ui.label(
-            RichText::new(if staged { "in the index" } else { "in the working tree" })
-                .font(theme::body(11.0))
-                .color(theme::FAINT),
+            RichText::new(if staged {
+                "in the index"
+            } else {
+                "in the working tree"
+            })
+            .font(theme::body(11.0))
+            .color(theme::FAINT),
         );
         if let Some(diff) = diff {
             let (added, removed) = diff.counts();
@@ -468,17 +554,24 @@ fn show_diff(
                     };
 
                     if ui
-                        .add(egui::Button::new(
-                            RichText::new(label).font(theme::body(11.0)),
-                        ))
+                        .add_enabled(
+                            !read_only,
+                            egui::Button::new(RichText::new(label).font(theme::body(11.0))),
+                        )
                         .on_hover_text(hint)
                         .clicked()
                     {
                         let path = path.to_string();
                         *action = Some(if staged {
-                            Action::UnstageHunk { path, hunk: hunk.id }
+                            Action::UnstageHunk {
+                                path,
+                                hunk: hunk.id,
+                            }
                         } else {
-                            Action::StageHunk { path, hunk: hunk.id }
+                            Action::StageHunk {
+                                path,
+                                hunk: hunk.id,
+                            }
                         });
                     }
 
@@ -494,11 +587,14 @@ fn show_diff(
 
                         if !staged
                             && ui
-                                .add(egui::Button::new(
-                                    RichText::new("Discard")
-                                        .font(theme::body(11.0))
-                                        .color(theme::REMOVED),
-                                ))
+                                .add_enabled(
+                                    !read_only,
+                                    egui::Button::new(
+                                        RichText::new("Discard")
+                                            .font(theme::body(11.0))
+                                            .color(theme::REMOVED),
+                                    ),
+                                )
                                 .on_hover_text("Undo just this hunk in the working tree")
                                 .clicked()
                         {

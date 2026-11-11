@@ -16,8 +16,8 @@
 mod action_bar;
 mod board_view;
 mod changes_view;
-mod conflict_view;
 mod chooser;
+mod conflict_view;
 mod detail_view;
 mod diff_view;
 mod file_view;
@@ -33,9 +33,9 @@ mod toast;
 use anyhow::Result;
 use eframe::egui;
 use gitrust_core::{
-    compose, layout, layout_with_working, Join, Move, Backlog, Board, CommitDetail, FileDiff, Graph, HunkId,
-    Oid, PullMode, PullRequests, RefEntry, RefKind, Repo, Settings, StashEntry, Tracking,
-    WorkingState, Worktree,
+    compose, layout, layout_with_working, Backlog, Board, CommitDetail, FileDiff, Graph, HunkId,
+    Join, Move, Oid, PullMode, PullRequests, Reader, RefEntry, RefKind, RemoteRepo, Repo, Settings,
+    StashEntry, Tracking, WorkingState, Worktree,
 };
 
 /// How wide the repository menu is, measured inside its frame.
@@ -178,7 +178,10 @@ struct App {
     cloning: Option<Cloning>,
     /// A folder being chosen in the desktop's own dialog, and which box the
     /// answer belongs in.
-    browsing: Option<(bool, std::sync::mpsc::Receiver<Result<Option<std::path::PathBuf>>>)>,
+    browsing: Option<(
+        bool,
+        std::sync::mpsc::Receiver<Result<Option<std::path::PathBuf>>>,
+    )>,
     /// What somebody has said they prefer. It is about this computer, not
     /// about a repository, so it is held here and lent to whichever tab is
     /// on top rather than being a copy per tab that would drift apart.
@@ -215,7 +218,11 @@ impl App {
     /// files with nothing to tell them apart, and the second one would
     /// quietly disagree with the first as soon as anything was staged.
     fn open_tab(&mut self, path: std::path::PathBuf) {
-        match self.open.iter().position(|open| std::path::Path::new(&open.path) == path) {
+        match self
+            .open
+            .iter()
+            .position(|open| std::path::Path::new(&open.path) == path)
+        {
             Some(which) => {
                 self.at = which;
                 self.picking = None;
@@ -230,6 +237,18 @@ impl App {
         self.at = self.open.len() - 1;
         self.picking = None;
         self.remember(self.at);
+    }
+
+    fn add_remote(&mut self, session: gitrust_core::ssh::Session, path: String) {
+        match RemoteRepo::new(session, path) {
+            Ok(repo) => {
+                self.open.push(Open::new_remote(repo, self.opened));
+                self.opened += 1;
+                self.at = self.open.len() - 1;
+                self.picking = None;
+            }
+            Err(err) => self.complain(err),
+        }
     }
 
     /// Writes down that a repository was opened, so the screen can offer it
@@ -282,6 +301,7 @@ impl App {
     fn act_on_pick(&mut self, act: picker::Act) {
         match act {
             picker::Act::Open(path) => self.open_tab(path),
+            picker::Act::OpenRemote { session, path } => self.add_remote(session, path),
             picker::Act::Start(path) => match gitrust_core::start::init(&path) {
                 Ok(_) => self.add(path.display().to_string()),
                 Err(err) => self.complain(err),
@@ -373,7 +393,11 @@ impl App {
     /// is the only one that is not typing.
     fn poll_dropped(&mut self, ctx: &egui::Context) {
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
-            i.raw.dropped_files.iter().filter_map(|file| file.path.clone()).collect()
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
         });
 
         for path in dropped {
@@ -427,7 +451,12 @@ impl App {
             .frame(
                 egui::Frame::NONE
                     .fill(theme::CANVAS)
-                    .inner_margin(egui::Margin { left: 8, right: 8, top: 5, bottom: 0 }),
+                    .inner_margin(egui::Margin {
+                        left: 8,
+                        right: 8,
+                        top: 5,
+                        bottom: 0,
+                    }),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -499,7 +528,9 @@ impl App {
     fn plus(&mut self, ui: &mut egui::Ui) {
         let button = ui.add(
             egui::Button::new(
-                egui::RichText::new("+").font(theme::body(14.0)).color(theme::MUTED),
+                egui::RichText::new("+")
+                    .font(theme::body(14.0))
+                    .color(theme::MUTED),
             )
             .frame(false)
             .min_size(egui::vec2(22.0, 20.0)),
@@ -555,8 +586,11 @@ impl App {
             return;
         };
 
-        let open_now: Vec<std::path::PathBuf> =
-            self.open.iter().map(|open| std::path::PathBuf::from(&open.path)).collect();
+        let open_now: Vec<std::path::PathBuf> = self
+            .open
+            .iter()
+            .map(|open| std::path::PathBuf::from(&open.path))
+            .collect();
         let known = std::mem::take(&mut self.known);
         let glance = std::mem::take(&mut self.glance);
 
@@ -644,6 +678,8 @@ struct Open {
     /// onto somebody else's remembered state.
     salt: u64,
     path: String,
+    /// A remote tab owns the authenticated session for its whole lifetime.
+    remote: Option<RemoteRepo>,
     /// A folder this tab has asked for a tab of its own.
     ///
     /// A tab cannot make a tab: the list of them belongs to the window, and
@@ -853,22 +889,46 @@ struct Confirm {
 /// type from the views' actions: that way there is no looping back to asking.
 enum Deed {
     Discard(String),
-    DiscardHunk { path: String, hunk: HunkId },
+    DiscardHunk {
+        path: String,
+        hunk: HunkId,
+    },
     DiscardAll(Vec<String>),
-    DeleteBranch { name: String, remote: bool },
-    CloseWorktree { name: String },
+    DeleteBranch {
+        name: String,
+        remote: bool,
+    },
+    CloseWorktree {
+        name: String,
+    },
     /// Throw away whatever is half-done.
     Abandon,
-    MoveTo { oid: Oid, how: Move },
-    Land { base: String, branch: String },
+    MoveTo {
+        oid: Oid,
+        how: Move,
+    },
+    Land {
+        base: String,
+        branch: String,
+    },
     Review(String),
 }
 
 impl Open {
     fn new(path: String, salt: u64) -> Self {
+        Self::with_backend(path, salt, None)
+    }
+
+    fn new_remote(remote: RemoteRepo, salt: u64) -> Self {
+        let path = remote.location();
+        Self::with_backend(path, salt, Some(remote))
+    }
+
+    fn with_backend(path: String, salt: u64, remote: Option<RemoteRepo>) -> Self {
         let mut app = Self {
             salt,
             path,
+            remote,
             elsewhere: None,
             head: String::new(),
             summary: String::new(),
@@ -928,6 +988,10 @@ impl Open {
         app
     }
 
+    fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
     /// Opens the window straight onto one screen, for photographing it.
     ///
     /// `GITRUST_SHOT=board`, `changes:<path>`, `diff:<path>`, `whole:<path>`,
@@ -977,6 +1041,10 @@ impl Open {
 
     /// Reloads everything: history, references and the working tree's state.
     fn load(&mut self) {
+        if self.is_remote() {
+            self.load_remote();
+            return;
+        }
         let started = std::time::Instant::now();
         // A reload changes which commit is the last one, so a message brought
         // in from it is no longer good for anything.
@@ -1015,6 +1083,78 @@ impl Open {
         self.status = format!("read in {} ms", started.elapsed().as_millis());
         self.status_failed = false;
         self.reload_detail(&repo);
+    }
+
+    fn load_remote(&mut self) {
+        let started = std::time::Instant::now();
+        let Some(repo) = self.remote.as_ref() else {
+            return;
+        };
+        self.head = repo.head_name();
+        self.path = repo.location();
+        self.half = gitrust_core::Half::None;
+        self.clashes.clear();
+        self.tracking = None;
+        self.worktrees.clear();
+        self.stashes.clear();
+        self.refs = match repo.references() {
+            Ok(value) => value,
+            Err(err) => return self.fail(err),
+        };
+        self.work = match repo.status() {
+            Ok(value) => value,
+            Err(err) => return self.fail(err),
+        };
+        if let Some((path, staged)) = self.selected.clone() {
+            self.diff = repo.file_diff(&path, staged).ok();
+        }
+        let commits = match repo.commits(self.limit) {
+            Ok(value) => value,
+            Err(err) => return self.fail(err),
+        };
+        let total = commits.len();
+        let head = self
+            .refs
+            .iter()
+            .find(|reference| reference.is_head)
+            .map(|reference| reference.target);
+        self.graph = match head.filter(|_| !self.work.is_clean()) {
+            Some(head) => layout_with_working(commits, head),
+            None => layout(commits),
+        };
+        let refs = self.refs.len();
+        self.summary = format!(
+            "{total} {} across {refs} {} · remote read-only",
+            if total == 1 { "commit" } else { "commits" },
+            if refs == 1 { "ref" } else { "refs" }
+        );
+        self.preselect();
+        self.status = format!("read remotely in {} ms", started.elapsed().as_millis());
+        self.status_failed = false;
+        self.reload_remote_detail();
+    }
+
+    fn reload_remote_detail(&mut self) {
+        let Some(oid) = self.selected_commit.filter(|oid| !oid.is_zero()) else {
+            self.detail = None;
+            self.detail_diff = None;
+            return;
+        };
+        let Some(repo) = self.remote.as_ref() else {
+            return;
+        };
+        self.detail = repo.commit_detail(oid).ok();
+        if self.detail_file.is_none() {
+            self.detail_file = self
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.files.first())
+                .map(|file| file.path.clone());
+        }
+        self.detail_diff = self
+            .detail_file
+            .as_deref()
+            .and_then(|path| repo.commit_file_diff(oid, path).ok());
     }
 
     /// Lays out the graph, with the uncommitted-changes row if the working
@@ -1101,7 +1241,10 @@ impl Open {
     }
 
     fn has_working_row(&self) -> bool {
-        self.graph.rows.first().is_some_and(|row| row.commit.is_working())
+        self.graph
+            .rows
+            .first()
+            .is_some_and(|row| row.commit.is_working())
     }
 
     /// Takes amend mode off and gives back whatever was being written.
@@ -1169,7 +1312,11 @@ impl Open {
 
         // If the picked file is no longer on its side, we let the pick go.
         if let Some((path, staged)) = self.selected.clone() {
-            let list = if staged { &self.work.staged } else { &self.work.unstaged };
+            let list = if staged {
+                &self.work.staged
+            } else {
+                &self.work.unstaged
+            };
             if list.iter().any(|file| file.path == path) {
                 self.diff = repo.file_diff(&path, staged).ok();
             } else {
@@ -1221,6 +1368,10 @@ impl Open {
         self.detail_file = None;
         self.detail_diff = None;
 
+        if self.is_remote() {
+            self.reload_remote_detail();
+            return;
+        }
         match self.repo() {
             Ok(repo) => self.reload_detail(&repo),
             Err(err) => self.fail(err),
@@ -1231,10 +1382,13 @@ impl Open {
         let Some(oid) = self.selected_commit else {
             return;
         };
-        self.detail_diff = self
-            .repo()
-            .and_then(|repo| repo.commit_file_diff(oid, &path))
-            .ok();
+        self.detail_diff = match self.remote.as_ref() {
+            Some(repo) => repo.commit_file_diff(oid, &path).ok(),
+            None => self
+                .repo()
+                .and_then(|repo| repo.commit_file_diff(oid, &path))
+                .ok(),
+        };
         self.detail_file = Some(path);
     }
 
@@ -1422,7 +1576,10 @@ impl Open {
     fn decide(&mut self) {
         self.looking = None;
         let first = self.clashes.first().map(|clash| clash.path.clone());
-        self.deciding = Some(conflict_view::Deciding { path: first, draft: None });
+        self.deciding = Some(conflict_view::Deciding {
+            path: first,
+            draft: None,
+        });
     }
 
     fn act_on_conflict(&mut self, act: conflict_view::Act) {
@@ -1542,7 +1699,10 @@ impl Open {
                 if let Some(looking) = &mut self.looking {
                     looking.at = oid;
                     let story = looking.read.story.take();
-                    looking.read = file_view::Read { story, ..Default::default() };
+                    looking.read = file_view::Read {
+                        story,
+                        ..Default::default()
+                    };
                     looking.trouble = None;
                 }
                 self.read_file();
@@ -1644,7 +1804,10 @@ impl Open {
     /// Asks before deleting a branch, saying what it costs.
     fn ask_delete_branch(&mut self, name: String, remote: bool) {
         if remote {
-            let server = name.split_once('/').map(|(server, _)| server).unwrap_or("the remote");
+            let server = name
+                .split_once('/')
+                .map(|(server, _)| server)
+                .unwrap_or("the remote");
             let detail = format!(
                 "It is deleted on {server}, not just here. Anyone who has it keeps seeing it until they fetch."
             );
@@ -1657,10 +1820,12 @@ impl Open {
         }
 
         // How many commits go with it is the only question that matters.
-        let alone = self.repo().and_then(|repo| repo.unmerged(&name)).unwrap_or(0);
+        let alone = self
+            .repo()
+            .and_then(|repo| repo.unmerged(&name))
+            .unwrap_or(0);
         let detail = match alone {
-            0 => "Everything it has is somewhere else too, so nothing is lost."
-                .to_string(),
+            0 => "Everything it has is somewhere else too, so nothing is lost.".to_string(),
             1 => "It has one commit that is on no other branch, remote or tag. That goes with it."
                 .to_string(),
             n => format!(
@@ -1783,9 +1948,8 @@ impl Open {
         let (send, done) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
-            let _ = send.send(
-                Repo::open(&path).and_then(|repo| repo.board_against(&base, pulls.as_ref())),
-            );
+            let _ = send
+                .send(Repo::open(&path).and_then(|repo| repo.board_against(&base, pulls.as_ref())));
         });
 
         self.laying = Some(Laying { done });
@@ -1908,7 +2072,10 @@ impl Open {
 
         // What is uncommitted there is the only thing that cannot be had
         // back, so it is the number that goes in the question.
-        let loose = self.repo().and_then(|repo| repo.worktree_changes(&name)).unwrap_or(0);
+        let loose = self
+            .repo()
+            .and_then(|repo| repo.worktree_changes(&name))
+            .unwrap_or(0);
         let detail = match loose {
             0 => format!(
                 "{where_it_is} is deleted. The branch stays where it is, and \
@@ -2066,8 +2233,11 @@ impl Open {
             return;
         };
 
-        let (title, detail, verb) =
-            (confirm.title.clone(), confirm.detail.clone(), confirm.verb.clone());
+        let (title, detail, verb) = (
+            confirm.title.clone(),
+            confirm.detail.clone(),
+            confirm.verb.clone(),
+        );
         let mut go = false;
         let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
 
@@ -2135,11 +2305,20 @@ impl Open {
 
     /// Opens the note for a branch, with whatever is already written in it.
     fn describe(&mut self, branch: String) {
-        let found = self.repo().ok().and_then(|repo| repo.note(&branch).ok().flatten());
+        let found = self
+            .repo()
+            .ok()
+            .and_then(|repo| repo.note(&branch).ok().flatten());
         self.describing = Some(Describing {
             had: found.is_some(),
-            title: found.as_ref().map(|note| note.title.clone()).unwrap_or_default(),
-            body: found.as_ref().map(|note| note.body.clone()).unwrap_or_default(),
+            title: found
+                .as_ref()
+                .map(|note| note.title.clone())
+                .unwrap_or_default(),
+            body: found
+                .as_ref()
+                .map(|note| note.body.clone())
+                .unwrap_or_default(),
             branch,
         });
     }
@@ -2176,7 +2355,9 @@ impl Open {
                 );
                 ui.add_space(2.0);
                 ui.label(
-                    egui::RichText::new(&branch).font(theme::mono(11.0)).color(theme::MUTED),
+                    egui::RichText::new(&branch)
+                        .font(theme::mono(11.0))
+                        .color(theme::MUTED),
                 );
                 ui.add_space(12.0);
 
@@ -2279,7 +2460,13 @@ impl Open {
             .and_then(|repo| repo.has_room(&onto, &from))
             .unwrap_or(false);
         let at = ctx.pointer_latest_pos().unwrap_or_default();
-        self.joining = Some(Joining { from, onto, room, at, armed: false });
+        self.joining = Some(Joining {
+            from,
+            onto,
+            room,
+            at,
+            armed: false,
+        });
     }
 
     /// The menu the drop opens, where the drop happened.
@@ -2366,8 +2553,7 @@ impl Open {
                         }
 
                         let button = egui::Button::new(
-                            egui::RichText::new(how.says(&from, &onto))
-                                .font(theme::body(12.5)),
+                            egui::RichText::new(how.says(&from, &onto)).font(theme::body(12.5)),
                         )
                         .min_size(egui::vec2(ui.available_width(), 24.0));
 
@@ -2415,8 +2601,11 @@ impl Open {
             return;
         };
 
-        let (title, hint, verb) =
-            (naming.title.clone(), naming.hint.clone(), naming.verb.clone());
+        let (title, hint, verb) = (
+            naming.title.clone(),
+            naming.hint.clone(),
+            naming.verb.clone(),
+        );
         let mut go = false;
         let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
 
@@ -2431,7 +2620,9 @@ impl Open {
             .show(ctx, |ui| {
                 ui.set_width(372.0);
                 ui.label(
-                    egui::RichText::new(&title).font(theme::strong(14.0)).color(theme::TEXT),
+                    egui::RichText::new(&title)
+                        .font(theme::strong(14.0))
+                        .color(theme::TEXT),
                 );
                 ui.add_space(10.0);
 
@@ -2484,9 +2675,7 @@ impl Open {
             }
             match naming.deed {
                 Named::BranchAt(oid) => self.note_down(move |repo| repo.branch_at(&name, oid)),
-                Named::Rename(old) => {
-                    self.note_down(move |repo| repo.rename_branch(&old, &name))
-                }
+                Named::Rename(old) => self.note_down(move |repo| repo.rename_branch(&old, &name)),
             }
         } else if close {
             self.naming = None;
@@ -2535,7 +2724,13 @@ impl Open {
         match action {
             Action::Select { path, staged } => {
                 self.selected = Some((path.clone(), staged));
-                self.diff = self.repo().and_then(|r| r.file_diff(&path, staged)).ok();
+                self.diff = match self.remote.as_ref() {
+                    Some(repo) => repo.file_diff(&path, staged).ok(),
+                    None => self
+                        .repo()
+                        .and_then(|repo| repo.file_diff(&path, staged))
+                        .ok(),
+                };
             }
             Action::Stage(path) => {
                 self.run(|repo| repo.stage(&path));
@@ -2572,8 +2767,12 @@ impl Open {
                 );
             }
             Action::DiscardAll => {
-                let paths: Vec<String> =
-                    self.work.unstaged.iter().map(|file| file.path.clone()).collect();
+                let paths: Vec<String> = self
+                    .work
+                    .unstaged
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect();
                 self.ask(
                     format!("Discard {}?", theme::files_label(paths.len())),
                     "The ones Git knows go back to the index; the new ones go from the disk. None of it can be got back.",
@@ -2582,7 +2781,8 @@ impl Open {
                 );
             }
             Action::StageAll => {
-                let paths: Vec<String> = self.work.unstaged.iter().map(|f| f.path.clone()).collect();
+                let paths: Vec<String> =
+                    self.work.unstaged.iter().map(|f| f.path.clone()).collect();
                 self.run(|repo| repo.stage_all(&paths));
             }
             Action::UnstageAll => {
@@ -2656,15 +2856,13 @@ impl Open {
             Action::PushForce => self.spawn("forcing", |repo| repo.push_force()),
             Action::PushTags => self.spawn("sending tags", |repo| repo.push_tags()),
 
-            Action::Branch(name) => {
-                match self.repo().and_then(|repo| repo.branch_here(&name)) {
-                    Ok(()) => {
-                        self.load();
-                        self.said(format!("you are now on {name}"));
-                    }
-                    Err(err) => self.note_error(format!("{err:#}")),
+            Action::Branch(name) => match self.repo().and_then(|repo| repo.branch_here(&name)) {
+                Ok(()) => {
+                    self.load();
+                    self.said(format!("you are now on {name}"));
                 }
-            }
+                Err(err) => self.note_error(format!("{err:#}")),
+            },
 
             Action::StashSave(message) => self.local(|repo| repo.stash_save(&message)),
             Action::StashPop(index) => self.local(|repo| repo.stash_pop(index)),
@@ -2798,13 +2996,11 @@ impl Open {
                 .inner_margin(egui::Margin::symmetric(12, 0)),
         };
 
-        egui::CentralPanel::default()
-            .frame(frame)
-            .show(ctx, |ui| {
-                // Each tab keeps its own scroll positions and folds. Without
-                // this they are all one window as far as egui is concerned,
-                // and scrolling one repository's history scrolls the rest.
-                ui.push_id(self.salt, |ui| match self.view {
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            // Each tab keeps its own scroll positions and folds. Without
+            // this they are all one window as far as egui is concerned,
+            // and scrolling one repository's history scrolls the rest.
+            ui.push_id(self.salt, |ui| match self.view {
                 View::History => {
                     // With a detached HEAD there is no branch for the menu to
                     // merge into or move up, the same as in the sidebar.
@@ -2836,7 +3032,13 @@ impl Open {
                         self.select_commit(oid);
                     }
                     if let Some(picked) = asked.pick {
-                        self.act_on_ref(picked, ctx);
+                        if self.is_remote() {
+                            if let refs_view::Pick::Show(oid) = picked {
+                                self.reveal_commit(oid);
+                            }
+                        } else {
+                            self.act_on_ref(picked, ctx);
+                        }
                     }
                 }
                 View::Board => {
@@ -2957,6 +3159,7 @@ impl Open {
                     }
                 }
                 View::Changes => {
+                    let read_only = self.is_remote();
                     let (amendable, pushed) = self.amend_state();
                     let selected = self
                         .selected
@@ -2971,20 +3174,31 @@ impl Open {
                         pushed: pushed.as_deref(),
                     };
 
+                    if read_only {
+                        ui.label(
+                            egui::RichText::new(
+                                "Remote checkout — staging and commits arrive in deliverable 3.",
+                            )
+                            .color(theme::MUTED),
+                        );
+                    }
                     let action = changes_view::show(
                         ui,
                         &self.work,
                         selected,
                         self.diff.as_ref(),
                         &mut draft,
+                        read_only,
                     );
 
                     if let Some(action) = action {
-                        self.handle(action);
+                        if !read_only || matches!(action, changes_view::Action::Select { .. }) {
+                            self.handle(action);
+                        }
                     }
                 }
             })
-            });
+        });
 
         self.toasting(ctx);
     }
@@ -3038,8 +3252,7 @@ impl Open {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new("See it through")
-                                        .font(theme::medium(12.0)),
+                                    egui::RichText::new("See it through").font(theme::medium(12.0)),
                                 )
                                 .fill(theme::CHOSEN),
                             )
@@ -3070,6 +3283,9 @@ impl Open {
 
 impl Open {
     fn top_bar(&mut self, ctx: &egui::Context, settings: &mut Settings) {
+        if self.is_remote() {
+            return self.remote_top_bar(ctx);
+        }
         egui::TopBottomPanel::top(egui::Id::new(("bar", self.salt)))
             .frame(
                 egui::Frame::NONE
@@ -3141,6 +3357,36 @@ impl Open {
             });
     }
 
+    fn remote_top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top(egui::Id::new(("bar", self.salt)))
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::RAISED)
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Remote checkout · read-only")
+                            .font(theme::medium(12.5))
+                            .color(theme::HEAD),
+                    );
+                    theme::vrule(ui);
+                    ui.selectable_value(&mut self.view, View::History, "History");
+                    ui.selectable_value(&mut self.view, View::Changes, "Changes");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("↻")
+                            .on_hover_text("Reload remote checkout")
+                            .clicked()
+                        {
+                            self.load();
+                        }
+                    });
+                })
+            });
+    }
+
     /// Which repository is open, and how to change it.
     ///
     /// Day to day the folder's name is enough. The whole path, which ate a
@@ -3179,8 +3425,7 @@ impl Open {
                             .margin(egui::vec2(8.0, 5.0))
                             .font(theme::mono(11.5))
                             .hint_text(
-                                egui::RichText::new("path to a repository")
-                                    .color(theme::FAINT),
+                                egui::RichText::new("path to a repository").color(theme::FAINT),
                             ),
                     );
                     go = ui.button("Open").clicked()
@@ -3285,16 +3530,18 @@ impl Open {
                     .inner_margin(egui::Margin::symmetric(10, 0)),
             )
             .show(ctx, |ui| {
-                picked = refs_view::show(
-                    ui,
-                    &self.refs,
-                    &self.worktrees,
-                    std::path::Path::new(&self.path),
-                    &mut self.ref_filter,
-                    self.selected_commit,
-                    on_branch.then_some(self.head.as_str()),
-                    self.job.is_some(),
-                );
+                ui.add_enabled_ui(!self.is_remote(), |ui| {
+                    picked = refs_view::show(
+                        ui,
+                        &self.refs,
+                        &self.worktrees,
+                        std::path::Path::new(&self.path),
+                        &mut self.ref_filter,
+                        self.selected_commit,
+                        on_branch.then_some(self.head.as_str()),
+                        self.job.is_some(),
+                    );
+                });
             });
 
         if let Some(picked) = picked {
@@ -3319,9 +3566,7 @@ impl Open {
                 let doing = format!("merging {name}");
                 self.spawn(&doing, move |repo| repo.merge(&name));
             }
-            refs_view::Pick::DeleteBranch { name, remote } => {
-                self.ask_delete_branch(name, remote)
-            }
+            refs_view::Pick::DeleteBranch { name, remote } => self.ask_delete_branch(name, remote),
             refs_view::Pick::FastForward(name) => {
                 self.note_down(move |repo| repo.fast_forward_to(&name))
             }
@@ -3473,12 +3718,14 @@ impl Open {
                         &mut draft,
                     );
                 } else {
+                    let read_only = self.is_remote();
                     clicked = detail_view::show(
                         ui,
                         self.detail.as_ref(),
                         self.detail_file.as_deref(),
                         self.detail_diff.as_ref(),
                         &mut self.tag,
+                        read_only,
                     );
                 }
             });
@@ -3488,8 +3735,11 @@ impl Open {
         }
         match clicked {
             Some(detail_view::Pick::File(path)) => self.select_detail_file(path),
-            Some(detail_view::Pick::Open(path)) => self.look_at(path),
-            Some(detail_view::Pick::Tag { name, message }) => self.create_tag(name, message),
+            Some(detail_view::Pick::Open(path)) if !self.is_remote() => self.look_at(path),
+            Some(detail_view::Pick::Tag { name, message }) if !self.is_remote() => {
+                self.create_tag(name, message)
+            }
+            Some(detail_view::Pick::Open(_)) | Some(detail_view::Pick::Tag { .. }) => {}
             None => {}
         }
     }
@@ -3511,4 +3761,3 @@ impl Open {
         }
     }
 }
-

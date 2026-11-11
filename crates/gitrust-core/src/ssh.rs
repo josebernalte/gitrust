@@ -96,7 +96,7 @@ impl Session {
         &self.login
     }
 
-    fn command(&self, words: &[&str]) -> Result<String> {
+    pub(crate) fn command(&self, words: &[&str]) -> Result<String> {
         let command = words
             .iter()
             .map(|word| quote(word))

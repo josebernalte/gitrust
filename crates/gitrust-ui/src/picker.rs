@@ -20,6 +20,9 @@ use crate::theme;
 pub enum Act {
     /// Open that repository in a tab.
     Open(PathBuf),
+    /// Open the authenticated checkout without ever putting its path on this
+    /// computer's known-repository list.
+    OpenRemote { session: ssh::Session, path: String },
     /// Bring one down from an address into a folder.
     Clone { url: String, into: PathBuf },
     /// Make an empty one there.
@@ -285,8 +288,7 @@ fn buttons(ui: &mut egui::Ui, state: &mut Picker) -> Option<Act> {
     };
 
     if asking == Asking::Remote {
-        remote_picker(ui, &mut state.remote);
-        return None;
+        return remote_picker(ui, &mut state.remote);
     }
 
     ui.add_space(8.0);
@@ -382,7 +384,8 @@ fn buttons(ui: &mut egui::Ui, state: &mut Picker) -> Option<Act> {
 /// The first half of opening a remote checkout: authenticate and choose a
 /// folder. A verified session remains here until the remote-tab backend is
 /// ready to take ownership of it.
-fn remote_picker(ui: &mut egui::Ui, remote: &mut Remote) {
+fn remote_picker(ui: &mut egui::Ui, remote: &mut Remote) -> Option<Act> {
+    let mut open = None;
     ui.add_space(8.0);
     if !remote.hosts.is_empty() {
         ui.horizontal_wrapped(|ui| {
@@ -479,8 +482,9 @@ fn remote_picker(ui: &mut egui::Ui, remote: &mut Remote) {
         }));
     }
     let Some(session) = remote.session.as_ref() else {
-        return;
+        return None;
     };
+    let mut use_folder = false;
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label(
@@ -504,13 +508,10 @@ fn remote_picker(ui: &mut egui::Ui, remote: &mut Remote) {
         }
         if ui.button("Use this folder").clicked() {
             remote.note = Some(match session.verify_checkout(&remote.path) {
-                Ok(_) => (
-                    format!(
-                        "{} is a remote Git checkout. Remote tabs arrive in deliverable 2.",
-                        remote.path
-                    ),
-                    false,
-                ),
+                Ok(_) => {
+                    use_folder = true;
+                    (format!("Opening {}…", remote.path), false)
+                }
                 Err(err) => (format!("Git: {err:#}"), true),
             });
         }
@@ -533,6 +534,14 @@ fn remote_picker(ui: &mut egui::Ui, remote: &mut Remote) {
                 }
             }
         });
+    if use_folder {
+        let session = remote.session.take().expect("session checked above");
+        open = Some(Act::OpenRemote {
+            session,
+            path: remote.path.clone(),
+        });
+    }
+    open
 }
 
 /// One repository: what it is called, where it is, and what it was at.
