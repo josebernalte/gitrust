@@ -12,7 +12,7 @@ use crate::{
 
 /// A remote checkout. Its session remains open for as long as this value does.
 pub struct RemoteRepo {
-    session: Session,
+    pub(crate) session: Session,
     path: String,
 }
 
@@ -105,7 +105,7 @@ impl RemoteRepo {
         Ok(Self { session, path })
     }
 
-    fn git(&self, arguments: &[&str]) -> Result<String> {
+    pub(crate) fn git(&self, arguments: &[&str]) -> Result<String> {
         let mut words = vec!["git", "-C", &self.path];
         words.extend(arguments);
         self.session.command(&words)
@@ -486,7 +486,10 @@ fn change_kind(code: char, other: char) -> Option<ChangeKind> {
 }
 
 fn remote_commit(row: &str, labels: &HashMap<Oid, Vec<RefLabel>>, head: &str) -> Result<Commit> {
-    let fields: Vec<&str> = row.split('\x1f').collect();
+    // `git log` appends its usual record newline after our record separator,
+    // so every row after the first begins with one. It is framing, not part
+    // of the object id.
+    let fields: Vec<&str> = row.trim_start_matches('\n').split('\x1f').collect();
     anyhow::ensure!(
         fields.len() == 6,
         "remote Git returned an incomplete history row"
@@ -626,5 +629,13 @@ mod tests {
         assert_eq!(commit.id.to_string(), id);
         assert!(commit.refs.is_empty());
         assert_eq!(commit.summary, "detached commit");
+    }
+
+    #[test]
+    fn history_rows_after_the_first_drop_gits_separator_newline() {
+        let id = "0123456789012345678901234567890123456789";
+        let row = format!("\n{id}\x1f0123456\x1fAna\x1f42\x1f\x1fsecond commit");
+        let commit = remote_commit(&row, &HashMap::new(), "main").unwrap();
+        assert_eq!(commit.id.to_string(), id);
     }
 }

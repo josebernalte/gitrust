@@ -172,6 +172,7 @@ pub fn show(
     bring: Option<usize>,
     head: Option<&str>,
     busy: bool,
+    remote_checkout: bool,
     // Whether the pointer leaves a wave behind. Off, the graph is drawn the
     // way it was before there was one: straight lanes, a flat band under the
     // row, and no frames asked for.
@@ -285,7 +286,7 @@ pub fn show(
                     let on = On { target: commit.id, reference };
 
                     response.context_menu(|ui| {
-                        refs_view::menu(ui, &on, upstream.as_deref(), head, busy, &mut picked);
+                        refs_view::menu(ui, &on, upstream.as_deref(), head, busy, remote_checkout, &mut picked);
                     });
                 }
             }

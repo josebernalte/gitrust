@@ -89,6 +89,7 @@ pub fn show(
     selected: Option<Oid>,
     head: Option<&str>,
     busy: bool,
+    remote_checkout: bool,
 ) -> Option<Pick> {
     let mut picked = None;
 
@@ -149,6 +150,7 @@ pub fn show(
                         selected,
                         head,
                         busy,
+                        remote_checkout,
                         !needle.is_empty(),
                         &mut picked,
                     );
@@ -158,7 +160,7 @@ pub fn show(
             // The other folders this same repository is checked out in. They
             // are not references, but they are the other half of "where am
             // I", and that question is answered here.
-            if trees.len() > 1 {
+            if !remote_checkout && trees.len() > 1 {
                 checkouts(ui, trees, here, busy, &mut picked);
             }
             ui.add_space(12.0);
@@ -217,6 +219,7 @@ fn section(
     selected: Option<Oid>,
     head: Option<&str>,
     busy: bool,
+    remote_checkout: bool,
     searching: bool,
     picked: &mut Option<Pick>,
 ) {
@@ -246,7 +249,7 @@ fn section(
         for entry in &entries {
             match entry.folder() {
                 Some(folder) => folders.entry(folder).or_default().push(entry),
-                None => leaf(ui, entry, remote_branches, local_branches, selected, head, busy, picked),
+                None => leaf(ui, entry, remote_branches, local_branches, selected, head, busy, remote_checkout, picked),
             }
         }
 
@@ -255,7 +258,7 @@ fn section(
             // nobody can see.
             theme::group(ui, folder, searching, |ui| {
                 for entry in group {
-                    leaf(ui, entry, remote_branches, local_branches, selected, head, busy, picked);
+                    leaf(ui, entry, remote_branches, local_branches, selected, head, busy, remote_checkout, picked);
                 }
             });
         }
@@ -405,6 +408,7 @@ fn leaf(
     selected: Option<Oid>,
     head: Option<&str>,
     busy: bool,
+    remote_checkout: bool,
     picked: &mut Option<Pick>,
 ) {
     // The color says what kind of reference it is: locals in the graph's
@@ -471,7 +475,7 @@ fn leaf(
     // click, the double click and the menu with it: that call registers its
     // own interaction on top of everything it drew, and sits over the lot.
     // Raising the sense of the label already there costs none of them.
-    let draggable = branch && !busy;
+    let draggable = branch && !busy && !remote_checkout;
     let response = response.interact(egui::Sense::click_and_drag());
     if draggable {
         response.dnd_set_drag_payload(Carried { name: entry.name.clone() });
@@ -480,7 +484,7 @@ fn leaf(
     // Only a local branch can be dropped on. Whichever of the three things
     // the answer turns out to be, it is the branch underneath that ends up
     // somewhere else, and a remote branch or a tag is not one to move here.
-    let takes_drops = entry.kind == RefKind::LocalBranch && !busy;
+    let takes_drops = entry.kind == RefKind::LocalBranch && !busy && !remote_checkout;
     let arriving = match takes_drops {
         true => response.dnd_hover_payload::<Carried>(),
         false => None,
@@ -546,7 +550,7 @@ fn leaf(
         }),
     };
     response.context_menu(|ui| {
-        menu(ui, &on, upstream.as_deref(), head, busy, picked);
+        menu(ui, &on, upstream.as_deref(), head, busy, remote_checkout, picked);
     });
 
     if switchable && response.double_clicked() {
@@ -588,6 +592,7 @@ pub fn menu(
     upstream: Option<&str>,
     head: Option<&str>,
     busy: bool,
+    remote_checkout: bool,
     picked: &mut Option<Pick>,
 ) {
     let kind = on.reference.as_ref().map(|named| named.kind);
@@ -619,7 +624,7 @@ pub fn menu(
             ui.close_menu();
         }
     }
-    if local && !is_head && !busy && ui.button("Open it in its own folder").clicked() {
+    if !remote_checkout && local && !is_head && !busy && ui.button("Open it in its own folder").clicked() {
         *picked = Some(Pick::Isolate(name.clone()));
         ui.close_menu();
     }
@@ -637,7 +642,7 @@ pub fn menu(
     // never against itself.
     if let Some(head) = head.filter(|_| switchable) {
         theme::rule(ui);
-        if ui
+        if !remote_checkout && ui
             .button(format!("Move {head} up to this"))
             .on_hover_text("and nothing else: if a merge would be needed it says so instead")
             .clicked()
@@ -719,7 +724,7 @@ pub fn menu(
                 *picked = Some(Pick::Revert(target));
                 ui.close_menu();
             }
-            if ui
+            if !remote_checkout && ui
                 .button("Rewrite from this commit\u{2026}")
                 .on_hover_text(
                     "squash, reword, drop or reorder everything from here to the tip. \
@@ -731,7 +736,7 @@ pub fn menu(
                 ui.close_menu();
             }
         }
-        if let Some(head) = head {
+        if !remote_checkout { if let Some(head) = head {
             ui.menu_button(format!("Move {head} to this commit"), |ui| {
                 ui.set_width(250.0);
                 for how in [Move::Keep, Move::Unstage, Move::Discard] {
@@ -750,7 +755,7 @@ pub fn menu(
                     }
                 }
             });
-        }
+        } }
     }
 
     // Naming, and unnaming.

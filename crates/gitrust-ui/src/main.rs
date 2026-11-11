@@ -1092,11 +1092,17 @@ impl Open {
         };
         self.head = repo.head_name();
         self.path = repo.location();
-        self.half = gitrust_core::Half::None;
-        self.clashes.clear();
-        self.tracking = None;
+        self.half = repo.half_done();
+        self.clashes = match repo.clashes() {
+            Ok(value) => value,
+            Err(err) => return self.fail(err),
+        };
+        if self.half == gitrust_core::Half::None {
+            self.deciding = None;
+        }
+        self.tracking = repo.tracking();
         self.worktrees.clear();
-        self.stashes.clear();
+        self.stashes = repo.stashes().unwrap_or_default();
         self.refs = match repo.references() {
             Ok(value) => value,
             Err(err) => return self.fail(err),
@@ -1613,7 +1619,13 @@ impl Open {
                 }
             }
             conflict_view::Act::Edit(path) => {
-                let read = self.repo().and_then(|repo| repo.clashing_text(&path));
+                let read = if let Some(remote) = self.remote.as_ref() {
+                    remote.read_working_file(&path).and_then(|bytes| {
+                        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{path} is a binary file and cannot be edited here"))
+                    })
+                } else {
+                    self.repo().and_then(|repo| repo.clashing_text(&path))
+                };
                 match read {
                     Ok(text) => {
                         if let Some(state) = &mut self.deciding {
@@ -1624,11 +1636,23 @@ impl Open {
                 }
             }
             conflict_view::Act::Take { path, side } => {
-                self.note_down(move |repo| repo.take_side(&path, side));
+                if self.is_remote() {
+                    let theirs = side == gitrust_core::Side::Theirs;
+                    self.run_remote(|repo| repo.take_conflict_side(&path, theirs));
+                } else {
+                    self.note_down(move |repo| repo.take_side(&path, side));
+                }
                 self.after_deciding();
             }
             conflict_view::Act::Write { path, text } => {
-                self.note_down(move |repo| repo.take_text(&path, &text));
+                if self.is_remote() {
+                    self.run_remote(|repo| {
+                        repo.write_working_file(&path, text.as_bytes())?;
+                        repo.stage(&path)
+                    });
+                } else {
+                    self.note_down(move |repo| repo.take_text(&path, &text));
+                }
                 if let Some(state) = &mut self.deciding {
                     state.draft = None;
                 }
@@ -1640,7 +1664,11 @@ impl Open {
                 // the core picks. A rebase writes one commit and walks on
                 // into the next, which is why the screen is pointed at
                 // whatever is clashing now rather than put away.
-                self.note_down(|repo| repo.see_it_through());
+                if self.is_remote() {
+                    self.run_remote(|repo| repo.continue_operation().map(|_| ()));
+                } else {
+                    self.note_down(|repo| repo.see_it_through());
+                }
                 self.after_deciding();
             }
             conflict_view::Act::Abandon => self.ask_abandon(),
@@ -1826,6 +1854,19 @@ impl Open {
 
     /// Asks before deleting a branch, saying what it costs.
     fn ask_delete_branch(&mut self, name: String, remote: bool) {
+        if self.is_remote() {
+            let detail = if remote {
+                "It is deleted from the checkout's upstream remote. Anyone who already has it keeps seeing it until they fetch."
+            } else {
+                "It is deleted from this remote checkout. Any commits only on it may become unreachable."
+            };
+            return self.ask(
+                format!("Delete {name}?"),
+                detail,
+                "Delete",
+                Deed::DeleteBranch { name, remote },
+            );
+        }
         if remote {
             let server = name
                 .split_once('/')
@@ -2205,15 +2246,27 @@ impl Open {
             Deed::DiscardAll(paths) => self.run(|repo| repo.discard_all(&paths)),
 
             // The remote one goes out on the network; the one here is instant.
-            Deed::DeleteBranch { name, remote } if remote => {
+            Deed::DeleteBranch { name, remote } if remote && !self.is_remote() => {
                 let doing = format!("deleting {name}");
                 return self.spawn(&doing, move |repo| repo.delete_remote_branch(&name));
+            }
+            Deed::DeleteBranch { name, remote } if self.is_remote() => {
+                if remote {
+                    self.run_remote(|repo| repo.delete_remote_branch(&name).map(|_| ()));
+                } else {
+                    self.run_remote(|repo| repo.delete_branch(&name));
+                }
+                return;
             }
             Deed::MoveTo { oid, how } => {
                 let doing = format!("moving to {}", &oid.to_string()[..7]);
                 return self.spawn(&doing, move |repo| repo.move_branch(oid, how));
             }
             Deed::Abandon => {
+                if self.is_remote() {
+                    self.run_remote(|repo| repo.abort_operation().map(|_| ()));
+                    return;
+                }
                 return self.spawn("throwing it away", |repo| repo.abandon());
             }
             Deed::CloseWorktree { name } => {
@@ -2700,9 +2753,11 @@ impl Open {
                 return self.note_error("it needs a name".to_string());
             }
             match naming.deed {
+                Named::BranchAt(oid) if self.is_remote() => { self.run_remote(|repo| repo.branch_at(&name, oid).map(|_| ())); }
                 Named::BranchAt(oid) => self.note_down(move |repo| repo.branch_at(&name, oid)),
+                Named::Rename(old) if self.is_remote() => { self.run_remote(|repo| repo.rename_branch(&old, &name).map(|_| ())); }
                 Named::Rename(old) => self.note_down(move |repo| repo.rename_branch(&old, &name)),
-            }
+            };
         } else if close {
             self.naming = None;
         }
@@ -2907,6 +2962,22 @@ impl Open {
     fn act(&mut self, action: action_bar::Action) {
         use action_bar::Action;
 
+        if self.is_remote() {
+            match action {
+                Action::Pull(mode) => self.run_remote(|repo| repo.pull(mode).map(|_| ())),
+                Action::Fetch => self.run_remote(|repo| repo.fetch_all().map(|_| ())),
+                Action::Push => self.run_remote(|repo| repo.push().map(|_| ())),
+                Action::PushForce => self.run_remote(|repo| repo.push_force().map(|_| ())),
+                Action::PushTags => self.run_remote(|repo| repo.push_tags().map(|_| ())),
+                Action::Branch(name) => self.run_remote(|repo| repo.branch_here(&name).map(|_| ())),
+                Action::StashSave(message) => self.run_remote(|repo| repo.stash_save(&message).map(|_| ())),
+                Action::StashPop(index) => self.run_remote(|repo| repo.stash_pop(index).map(|_| ())),
+                Action::StashApply(index) => self.run_remote(|repo| repo.stash_apply(index).map(|_| ())),
+                Action::StashDrop(index) => self.run_remote(|repo| repo.stash_drop(index).map(|_| ())),
+            };
+            return;
+        }
+
         match action {
             // The two that go out on the network leave for a thread of their
             // own. The rest are local and finish before anyone notices.
@@ -3088,20 +3159,13 @@ impl Open {
                         self.bring.take(),
                         on_branch.then_some(self.head.as_str()),
                         self.job.is_some(),
+                        self.is_remote(),
                         settings.waves,
                     );
                     if let Some(oid) = asked.show {
                         self.select_commit(oid);
                     }
-                    if let Some(picked) = asked.pick {
-                        if self.is_remote() {
-                            if let refs_view::Pick::Show(oid) = picked {
-                                self.reveal_commit(oid);
-                            }
-                        } else {
-                            self.act_on_ref(picked, ctx);
-                        }
-                    }
+                    if let Some(picked) = asked.pick { self.act_on_ref(picked, ctx); }
                 }
                 View::Board => {
                     // The forge is asked the first time the board is looked
@@ -3433,13 +3497,22 @@ impl Open {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Remote checkout · read-only")
+                        egui::RichText::new("Remote checkout")
                             .font(theme::medium(12.5))
                             .color(theme::HEAD),
                     );
                     theme::vrule(ui);
                     ui.selectable_value(&mut self.view, View::History, "History");
                     ui.selectable_value(&mut self.view, View::Changes, "Changes");
+                    theme::vrule(ui);
+                    let action = action_bar::show(
+                        ui,
+                        self.tracking.as_ref(),
+                        &self.stashes,
+                        &mut self.pull_mode,
+                        self.job.is_some(),
+                        &mut self.draft,
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .button("↻")
@@ -3449,6 +3522,9 @@ impl Open {
                             self.load();
                         }
                     });
+                    if let Some(action) = action {
+                        self.act(action);
+                    }
                 })
             });
     }
@@ -3583,6 +3659,7 @@ impl Open {
     /// at the changes.
     fn refs_panel(&mut self, ctx: &egui::Context) {
         let mut picked = None;
+        let remote_checkout = self.is_remote();
         // With a detached HEAD there is no branch to bring anything into.
         let on_branch = self.refs.iter().any(|entry| entry.is_head);
 
@@ -3596,7 +3673,7 @@ impl Open {
                     .inner_margin(egui::Margin::symmetric(10, 0)),
             )
             .show(ctx, |ui| {
-                ui.add_enabled_ui(!self.is_remote(), |ui| {
+                ui.add_enabled_ui(true, |ui| {
                     picked = refs_view::show(
                         ui,
                         &self.refs,
@@ -3606,6 +3683,7 @@ impl Open {
                         self.selected_commit,
                         on_branch.then_some(self.head.as_str()),
                         self.job.is_some(),
+                        remote_checkout,
                     );
                 });
             });
@@ -3621,6 +3699,35 @@ impl Open {
     /// same place: anything added here is in both at once, which is the point
     /// of them sharing it.
     fn act_on_ref(&mut self, picked: refs_view::Pick, ctx: &egui::Context) {
+        if self.is_remote() {
+            let result = match picked {
+                refs_view::Pick::Show(oid) => { self.reveal_commit(oid); self.view = View::History; return; }
+                refs_view::Pick::Switch { name, remote: true } => self.remote.as_ref().map(|repo| repo.checkout_remote(&name)),
+                refs_view::Pick::Switch { name, remote: false } => self.remote.as_ref().map(|repo| repo.checkout_branch(&name)),
+                refs_view::Pick::Merge(name) => self.remote.as_ref().map(|repo| repo.merge(&name)),
+                refs_view::Pick::Rebase(name) => self.remote.as_ref().map(|repo| repo.rebase_onto(&name)),
+                refs_view::Pick::Pull => self.remote.as_ref().map(|repo| repo.pull(PullMode::Merge)),
+                refs_view::Pick::Push(name) => self.remote.as_ref().map(|repo| repo.push_branch(&name)),
+                refs_view::Pick::Follow { branch, upstream } => self.remote.as_ref().map(|repo| repo.set_upstream(&branch, upstream.as_deref())),
+                refs_view::Pick::DeleteBranch { name, remote } => { self.ask_delete_branch(name, remote); return; }
+                refs_view::Pick::DeleteTag(name) => self.remote.as_ref().map(|repo| repo.delete_tag(&name).map(|_| format!("tag {name} deleted"))),
+                refs_view::Pick::BranchAt(oid) => {
+                    self.naming = Some(Naming { title: format!("A branch at {}", &oid.to_string()[..7]), hint: "feat/something".to_string(), verb: "Make it".to_string(), draft: String::new(), deed: Named::BranchAt(oid) });
+                    return;
+                }
+                refs_view::Pick::Rename(name) => {
+                    self.naming = Some(Naming { title: format!("Rename {name}"), hint: name.clone(), verb: "Rename".to_string(), draft: name.clone(), deed: Named::Rename(name) });
+                    return;
+                }
+                refs_view::Pick::GoTo(oid) => self.remote.as_ref().map(|repo| repo.checkout_commit(oid)),
+                refs_view::Pick::CherryPick(oid) => self.remote.as_ref().map(|repo| repo.cherry_pick(oid)),
+                refs_view::Pick::Revert(oid) => self.remote.as_ref().map(|repo| repo.revert(oid)),
+                refs_view::Pick::Copy(text) => { ctx.copy_text(text.clone()); self.said(format!("{text} copied")); return; }
+                refs_view::Pick::FastForward(_) | refs_view::Pick::Isolate(_) | refs_view::Pick::Rewrite(_) | refs_view::Pick::MoveTo(_, _) | refs_view::Pick::Visit(_) | refs_view::Pick::VisitTab(_) | refs_view::Pick::Release(_) | refs_view::Pick::Join { .. } => { self.note_error("that action is not available for a remote checkout".to_string()); return; }
+            };
+            match result { Some(Ok(note)) => { self.load(); self.said(note); }, Some(Err(err)) => self.note_error(format!("{err:#}")), None => self.note_error("no remote checkout".to_string()) }
+            return;
+        }
         match picked {
             refs_view::Pick::Show(oid) => {
                 self.reveal_commit(oid);
@@ -3784,7 +3891,9 @@ impl Open {
                         &mut draft,
                     );
                 } else {
-                    let read_only = self.is_remote();
+                    // A remote checkout can tag through its own Git command;
+                    // commit detail is otherwise read-only in either backend.
+                    let read_only = false;
                     clicked = detail_view::show(
                         ui,
                         self.detail.as_ref(),
@@ -3802,10 +3911,8 @@ impl Open {
         match clicked {
             Some(detail_view::Pick::File(path)) => self.select_detail_file(path),
             Some(detail_view::Pick::Open(path)) if !self.is_remote() => self.look_at(path),
-            Some(detail_view::Pick::Tag { name, message }) if !self.is_remote() => {
-                self.create_tag(name, message)
-            }
-            Some(detail_view::Pick::Open(_)) | Some(detail_view::Pick::Tag { .. }) => {}
+            Some(detail_view::Pick::Tag { name, message }) => self.create_tag(name, message),
+            Some(detail_view::Pick::Open(_)) => {}
             None => {}
         }
     }
@@ -3816,7 +3923,12 @@ impl Open {
             return self.note_error("no commit is selected".to_string());
         };
 
-        match self.repo().and_then(|repo| repo.tag(&name, oid, &message)) {
+        let result = if let Some(remote) = self.remote.as_ref() {
+            remote.tag(&name, oid, &message)
+        } else {
+            self.repo().and_then(|repo| repo.tag(&name, oid, &message))
+        };
+        match result {
             Ok(()) => {
                 // The new tag has to show up in the graph and in the sidebar,
                 // and that only happens by reading the references again.

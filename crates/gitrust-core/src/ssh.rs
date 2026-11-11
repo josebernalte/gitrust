@@ -42,18 +42,32 @@ impl Session {
     /// Connect using the supplied password, or the SSH agent when it is blank.
     /// The caller owns the password and can clear it as soon as this returns.
     pub fn connect(login: Login, password: Option<&str>, trust_new_host: bool) -> Result<Self> {
+        Self::connect_inner(login, password, None, trust_new_host, None)
+    }
+
+    /// Connect with an explicit private key and known-hosts file. This is
+    /// useful for isolated transport tests without borrowing the user's SSH
+    /// agent or their `known_hosts` file.
+    pub fn connect_with_key(login: Login, private_key: &Path, known_hosts: &Path, trust_new_host: bool) -> Result<Self> {
+        Self::connect_inner(login, None, Some(private_key), trust_new_host, Some(known_hosts))
+    }
+
+    fn connect_inner(login: Login, password: Option<&str>, private_key: Option<&Path>, trust_new_host: bool, known_hosts: Option<&Path>) -> Result<Self> {
         let tcp = TcpStream::connect((login.host.as_str(), login.port))
             .with_context(|| format!("could not reach {}:{}", login.host, login.port))?;
         let mut raw = RawSession::new().context("could not prepare SSH")?;
         raw.set_tcp_stream(tcp);
         raw.handshake().context("the SSH handshake failed")?;
-        verify_host(&raw, &login, trust_new_host)?;
+        verify_host(&raw, &login, trust_new_host, known_hosts)?;
 
-        match password.filter(|password| !password.is_empty()) {
-            Some(password) => raw
+        match (password.filter(|password| !password.is_empty()), private_key) {
+            (Some(password), _) => raw
                 .userauth_password(&login.user, password)
                 .context("the SSH password was refused")?,
-            None => raw
+            (None, Some(private_key)) => raw
+                .userauth_pubkey_file(&login.user, None, private_key, None)
+                .context("the SSH key was refused")?,
+            (None, None) => raw
                 .userauth_agent(&login.user)
                 .context("could not authenticate with the SSH agent")?,
         }
@@ -116,6 +130,10 @@ impl Session {
         Ok(())
     }
 
+    pub fn exists(&self, path: &str) -> bool {
+        self.raw.sftp().and_then(|sftp| sftp.stat(Path::new(path))).is_ok()
+    }
+
     pub(crate) fn command(&self, words: &[&str]) -> Result<String> {
         let command = words
             .iter()
@@ -151,12 +169,17 @@ impl Session {
 /// Refuse unknown or changed servers. The UI will later offer an explicit
 /// trust decision; silently adding a key here would make a first connection
 /// vulnerable to a machine-in-the-middle attack.
-fn verify_host(raw: &RawSession, login: &Login, trust_new_host: bool) -> Result<()> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let Some(home) = home else {
-        bail!("could not find known_hosts to verify {}", login.host)
+fn verify_host(raw: &RawSession, login: &Login, trust_new_host: bool, known_hosts: Option<&Path>) -> Result<()> {
+    let file = match known_hosts {
+        Some(file) => file.to_path_buf(),
+        None => {
+            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+            let Some(home) = home else {
+                bail!("could not find known_hosts to verify {}", login.host)
+            };
+            PathBuf::from(home).join(".ssh").join("known_hosts")
+        }
     };
-    let file = PathBuf::from(home).join(".ssh").join("known_hosts");
     let mut known = raw.known_hosts().context("could not read known_hosts")?;
     // An absent file is the normal first-connection case. `check` below will
     // report it as an unknown server and only the explicit UI choice may then

@@ -21,6 +21,7 @@ pub mod note;
 pub mod remote;
 pub mod reader;
 pub mod remote_repo;
+pub mod remote_ops;
 pub mod repo;
 pub mod rewrite;
 pub mod settings;
